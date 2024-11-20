@@ -27,7 +27,7 @@ on:
             required: false
 jobs:
   Authorization:
-    name: Authorization2
+    name: Authorization3
     runs-on: blossom 
     outputs:
       args: ${{ env.args }}
