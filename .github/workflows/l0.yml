@@ -1,0 +1,73 @@
+name: L0_CI
+
+on:
+  issue_comment:
+    types: [created]
+  push:
+    branches: [$default-branch]
+  pull_request:
+    branches: [$default-branch]
+  workflow_dispatch:
+      inputs:
+          platform:
+            description: 'runs-on argument'
+            required: false
+          args:
+            description: 'argument'
+            required: false
+
+env:
+  proc_num: $(nproc)
+  WHEEL_ARCHS: "80-real;86-real;89-real;90-real"
+  WHEEL_EXTRA_ARGS : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON"
+
+jobs:
+  build:
+    runs-on: self-hosted
+    container:
+      image: nvcr.io/nvidia/pytorch:24.12-py3
+    env:
+      TRT_URL: https://developer.nvidia.com/downloads/compute/machine-learning/tensorrt/10.7.0/tars/TensorRT-10.7.0.23.Linux.x86_64-gnu.cuda-12.6.tar.gz
+    steps:
+      - uses: actions/checkout@v4
+      - name: install tensorrt
+        run: |
+          CP_VERSION=cp312
+          mkdir /usr/local/tensorrt && curl -L ${{env.TRT_URL}} | tar --strip-components 1 -xz -C /usr/local/tensorrt
+          pip3 install /usr/local/tensorrt/python/tensorrt-*${CP_VERSION}*.whl
+      - name: install requirements
+        run: pip3 install -r requirements-dev.txt
+      - name: fix git configuration
+        run: git config --global --add safe.directory '*'
+      - name: build wheel
+        run: python3 scripts/build_wheel.py -j ${{env.proc_num}} -a '${{env.WHEEL_ARCHS}}' --trt_root /usr/local/tensorrt ${{env.WHEEL_EXTRA_ARGS}}
+      - name: Upload wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel_x86_64
+          path: build/tensorrt_llm-*.whl
+  test:
+    runs-on: [self-hosted, linux, x64]
+    needs: build
+    container:
+      image: nvcr.io/nvidia/pytorch:24.12-py3
+      env:
+        NODE_ENV: development
+      options: --gpus all
+    steps:
+      - name: download wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel_x86_64
+  Upload-Test:
+    name: Upload test
+    runs-on: self-hosted
+    if : github.event_name == 'workflow_dispatch'
+    steps:
+      - name: Collect test result
+        run: pwd && ls -l && curl -L ${{ fromJson(github.event.inputs.args).url }} | tar -xz
+      - name: Jenkins log for pull request ${{ fromJson(github.event.inputs.args).pr }} (click here)
+        uses: mikepenz/action-junit-report@v5
+        with:
+          report_paths: '**/results*.xml'
+          include_passed: false
