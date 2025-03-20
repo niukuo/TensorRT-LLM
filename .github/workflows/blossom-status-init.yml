@@ -1,0 +1,20 @@
+name: Blossom-Status-Init
+on:
+    pull_request:
+        types: [opened, synchronize, reopened]
+
+jobs:
+    Init-Status:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Init blossom-ci status
+              env:
+                GITHUB_CONTEXT: ${{ toJson(github) }}
+              run: |
+                echo "$GITHUB_CONTEXT"
+                echo "$GITHUB_SHA"
+                echo "$GITHUB_REF"
+                echo "$GITHUB_REPO"
+                echo "$GITHUB_RUN_ID"
+                echo "$GITHUB_RUN_NUMBER"
+
