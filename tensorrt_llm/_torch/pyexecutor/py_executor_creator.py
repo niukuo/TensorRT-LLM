@@ -2,33 +2,27 @@ import copy
 
 import tensorrt_llm
 import tensorrt_llm.bindings as tllm
-from tensorrt_llm._torch.attention_backend.interface import \
-    AttentionRuntimeFeatures
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._torch.pyexecutor.decoder import (EarlyStopDecoder,
-                                                    TorchDecoder,
-                                                    TorchStarAttentionDecoder,
-                                                    TRTLLMDecoder)
-from tensorrt_llm._torch.pyexecutor.distributed import MPIDist
-from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import (
-    AttentionTypeCpp, create_kv_cache_transceiver)
-from tensorrt_llm._torch.pyexecutor.model_engine import PyTorchModelEngine
-from tensorrt_llm._torch.pyexecutor.py_executor import PyExecutor
-from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
-                                                             ResourceManager)
-from tensorrt_llm._torch.pyexecutor.scheduler import (BindCapacityScheduler,
-                                                      BindMicroBatchScheduler,
-                                                      SimpleScheduler)
-from tensorrt_llm._torch.speculative import (get_num_spec_layers,
-                                             get_spec_decoder,
-                                             get_spec_resource_manager)
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
+from ..attention_backend.interface import AttentionRuntimeFeatures
+from ..speculative import (get_num_spec_layers, get_spec_decoder,
+                           get_spec_resource_manager)
 from ._util import check_flash_mla_config, estimate_max_kv_cache_tokens, is_mla
+from .config import PyTorchConfig
+from .decoder import (EarlyStopDecoder, TorchDecoder, TorchStarAttentionDecoder,
+                      TRTLLMDecoder)
+from .distributed import MPIDist
+from .guided_decoder import GuidedDecoderResourceManager
+from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
+from .model_engine import PyTorchModelEngine
+from .py_executor import PyExecutor
+from .resource_manager import KVCacheManager, ResourceManager
+from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
+                        SimpleScheduler)
 
 
 def create_py_executor(executor_config: ExecutorConfig,
@@ -43,6 +37,7 @@ def create_py_executor(executor_config: ExecutorConfig,
     if executor_config.mapping is None:
         mapping = Mapping(world_size=tensorrt_llm.mpi_world_size(),
                           tp_size=tensorrt_llm.mpi_world_size(),
+                          gpus_per_node=tensorrt_llm.default_gpus_per_node(),
                           rank=tensorrt_llm.mpi_rank())
     else:
         mapping = copy.deepcopy(executor_config.mapping)
@@ -85,6 +80,7 @@ def create_py_executor(executor_config: ExecutorConfig,
         attn_runtime_features=attn_runtime_features,
         dist=dist,
         spec_config=spec_config,
+        guided_decoding_config=executor_config.guided_decoding_config,
     )
     # PyTorchModelEngine modifies these fields, update them to executor_config
     if pytorch_backend_config.enable_overlap_scheduler:
@@ -156,7 +152,6 @@ def create_py_executor(executor_config: ExecutorConfig,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.
                 SELFKONLY,
                 num_layers=num_hidden_layers,
-                num_heads=num_attention_heads,
                 num_kv_heads=1,
                 head_dim=config.kv_lora_rank + config.qk_rope_head_dim,
                 tokens_per_block=executor_config.tokens_per_block,
@@ -178,7 +173,6 @@ def create_py_executor(executor_config: ExecutorConfig,
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
                 num_layers=num_hidden_layers,
-                num_heads=num_attention_heads,
                 num_kv_heads=num_key_value_heads,
                 head_dim=head_dim,
                 tokens_per_block=executor_config.tokens_per_block,
@@ -211,6 +205,15 @@ def create_py_executor(executor_config: ExecutorConfig,
     else:
         spec_decoder = None
 
+    if mapping.is_last_pp_rank(
+    ) and executor_config.guided_decoding_config is not None:
+        if spec_config is not None:
+            raise ValueError(
+                "Guided decoding does not support with speculative decoding.")
+        resources[
+            "guided_decoder_resource_manager"] = GuidedDecoderResourceManager(
+                executor_config.max_batch_size)
+
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}"
     )
@@ -228,11 +231,15 @@ def create_py_executor(executor_config: ExecutorConfig,
         resource_manager.resource_managers.move_to_end("kv_cache_manager",
                                                        last=True)
 
+    num_micro_batches = 1
+    if mapping.has_pp:
+        num_micro_batches = mapping.pp_size + pytorch_backend_config.enable_overlap_scheduler
+
     capacity_scheduler = BindCapacityScheduler(
         executor_config.max_batch_size,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
-        num_micro_batches=mapping.pp_size)
+        num_micro_batches=num_micro_batches)
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
                                            executor_config.max_num_tokens,
                                            ctx_chunk_config)

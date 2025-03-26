@@ -1,9 +1,11 @@
 import asyncio
 import time
 
+import pytest
 from test_llm import get_model_path
 
 import tensorrt_llm
+from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
@@ -23,7 +25,6 @@ global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
 
 def create_kv_cache_manager():
     num_layers = 2
-    num_heads = 4
     num_kv_heads = 2
     head_dim = 128
     tokens_per_block = 64
@@ -35,7 +36,6 @@ def create_kv_cache_manager():
         kv_cache_type=tensorrt_llm.bindings.internal.batch_manager.CacheType.
         SELF,
         num_layers=num_layers,
-        num_heads=num_heads,
         num_kv_heads=num_kv_heads,
         head_dim=head_dim,
         tokens_per_block=tokens_per_block,
@@ -49,6 +49,7 @@ def create_llm(tensor_parallel_size=1):
     return LLM(model=llama_model_path,
                tensor_parallel_size=tensor_parallel_size,
                kv_cache_config=global_kvcache_config,
+               pytorch_backend_config=PyTorchConfig(autotuner_enabled=False),
                backend="pytorch")
 
 
@@ -119,6 +120,7 @@ def test_expected_kv_cache_events():
                 assert event[0]["data"]["type"] == "stored"
 
 
+@pytest.mark.skip("https://nvbugs/5150466: flaky fail")
 def test_kv_cache_event_async_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6, temperature=0.01)

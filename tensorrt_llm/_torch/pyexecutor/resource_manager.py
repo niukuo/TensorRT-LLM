@@ -13,7 +13,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .llm_request import LlmRequest
+from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -89,7 +89,6 @@ class KVCacheManager(BaseResourceManager):
         kv_cache_type: CacheTypeCpp,
         *,
         num_layers: int,
-        num_heads: int,
         num_kv_heads: Union[int, List[Optional[int]]],
         head_dim: int,
         tokens_per_block: int,
@@ -103,7 +102,6 @@ class KVCacheManager(BaseResourceManager):
         # draft/target layers. Add extra tokens to haddle this issue.
         num_extra_kv_tokens: int = 0,
     ) -> None:
-        self.num_heads = num_heads
         self.num_layers = num_layers
         self.mapping = mapping
         self.dtype = dtype
@@ -190,7 +188,7 @@ class KVCacheManager(BaseResourceManager):
             'blocks_in_secondary_pool': self.blocks_in_secondary_pool,
             'max_num_sequences': max_batch_size,
             'max_beam_width': 1,  # TODO: more than 1 beam?
-            'max_attention_window': max_kv_cache_len,
+            'max_attention_window_vec': [max_kv_cache_len],
             'temporary_attention_window': 0,
             'sink_token_length': sink_token_length,
             'stream': self._stream.cuda_stream,
@@ -213,8 +211,6 @@ class KVCacheManager(BaseResourceManager):
         self.num_pools = self.impl.num_pools
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
 
-        self.max_num_slots = max_batch_size
-
     def shutdown(self):
         self.impl.release_pools()
 
@@ -229,7 +225,6 @@ class KVCacheManager(BaseResourceManager):
             kv_cache_config,
             kv_cache_type,
             num_layers=model_config.num_attention_layers(mapping.pp_size),
-            num_heads=model_config.num_heads,
             # NOTE: this preserves existing behavior in KV cache manager.
             # But we should change this to pass a list at some point.
             # We're assuming the KV cache is homogeneous here.
@@ -308,18 +303,17 @@ class KVCacheManager(BaseResourceManager):
                 1
             ] * token_num if self.impl.cross_kv else None
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
-            req = LlmRequest(
-                request_id=req_id,
-                max_new_tokens=1,
-                input_tokens=[1] * token_num,
-                sampling_config=tensorrt_llm.bindings.SamplingConfig(
-                    sampling_params._get_sampling_config()),
-                is_streaming=False,
-                encoder_input_tokens=encoder_input_tokens)
+            req = LlmRequest(request_id=req_id,
+                             max_new_tokens=1,
+                             input_tokens=[1] * token_num,
+                             sampling_config=SamplingConfig(
+                                 sampling_params._get_sampling_config()),
+                             is_streaming=False,
+                             encoder_input_tokens=encoder_input_tokens)
             req.paged_kv_block_ids = []
             self.impl.add_sequence(req_id, token_num, beam_width, req)
             if is_gen:
-                req.state = tensorrt_llm.bindings.LlmRequestState.GENERATION_IN_PROGRESS
+                req.state = LlmRequestState.GENERATION_IN_PROGRESS
                 req.prompt_len = token_num - 1 + max_num_draft_tokens
                 req.py_prompt_len = req.prompt_len
                 if max_num_draft_tokens > 0:
@@ -330,7 +324,7 @@ class KVCacheManager(BaseResourceManager):
     def update_resources(self, scheduled_batch: ScheduledRequests):
         # rewind kv cache
         for request in scheduled_batch.generation_requests:
-            if request.state != tensorrt_llm.bindings.LlmRequestState.GENERATION_COMPLETE:
+            if request.state != LlmRequestState.GENERATION_COMPLETE:
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)
 
@@ -485,7 +479,39 @@ class BaseDraftTokenManager(BaseResourceManager):
         return 0
 
 
-class ResourceManager(object):
+class SlotManager:
+
+    def __init__(self, max_num_requests: int):
+        self.max_num_requests = max_num_requests
+        self.slot_mapping = dict()
+        self.free_slots = set(range(max_num_requests))
+
+    def get_slot(self, request_id: int):
+        return self.slot_mapping.get(request_id, None)
+
+    def fill_slot_id_tensor(self, requests: List[LlmRequest],
+                            slot_id_tensor: torch.Tensor):
+        for i, request in enumerate(requests):
+            slot_id = self.get_slot(request.request_id)
+            if slot_id is not None:
+                slot_id_tensor[i] = slot_id
+            else:
+                raise ValueError(f"Request {request.request_id} has no slot id")
+
+    def add_slot(self, request_id: int):
+        if len(self.free_slots) == 0:
+            raise ValueError("No free slots")
+        slot = self.free_slots.pop()
+        self.slot_mapping[request_id] = slot
+        return slot
+
+    def remove_slot(self, request_id: int):
+        assert request_id in self.slot_mapping
+        slot = self.slot_mapping.pop(request_id)
+        self.free_slots.add(slot)
+
+
+class ResourceManager:
 
     def __init__(self, resource_managers: dict[str, BaseResourceManager]):
         self.resource_managers = OrderedDict(resource_managers)

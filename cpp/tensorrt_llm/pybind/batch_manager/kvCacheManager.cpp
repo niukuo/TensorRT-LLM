@@ -318,7 +318,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def_readwrite("tokens_per_block", &tbk::KvCacheStats::toksPerBlock)
         .def_readwrite("alloc_total_blocks", &tbk::KvCacheStats::allocTotalBlocks)
         .def_readwrite("alloc_new_blocks", &tbk::KvCacheStats::allocNewBlocks)
-        .def_readwrite("reused_blocks", &tbk::KvCacheStats::reusedBlocks);
+        .def_readwrite("reused_blocks", &tbk::KvCacheStats::reusedBlocks)
+        .def_readwrite("missed_blocks", &tbk::KvCacheStats::missedBlocks)
+        .def_readwrite("cache_hit_rate", &tbk::KvCacheStats::cacheHitRate);
 
     py::class_<tbk::KVCacheEventManager, std::shared_ptr<tbk::KVCacheEventManager>>(m, "KVCacheEventManager")
         .def(py::init<size_t>(), py::arg("max_kv_event_entries"));
@@ -429,12 +431,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
 
     py::classh<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
         .def(py::init<std::vector<SizeType32> const&, SizeType32, SizeType32, SizeType32, SizeType32, SizeType32,
-                 SizeType32, SizeType32, SizeType32, SizeType32, bool, int64_t, bool, bool, tbk::CacheType,
-                 std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool>(),
+                 SizeType32, std::vector<SizeType32> const&, SizeType32, SizeType32, bool, int64_t, bool, bool,
+                 tbk::CacheType, std::optional<tensorrt_llm::executor::RetentionPriority>,
+                 std::shared_ptr<tbk::KVCacheEventManager>, bool, bool>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
             py::arg("blocks_in_primary_pool"), py::arg("blocks_in_secondary_pool"), py::arg("max_num_sequences"),
-            py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("temporary_attention_window"),
+            py::arg("max_beam_width"), py::arg("max_attention_window_vec"), py::arg("temporary_attention_window"),
             py::arg("sink_token_length"), py::arg("stream"), py::arg("max_sequence_length"),
             py::arg("enable_block_reuse") = false, py::arg("onboard_blocks") = true,
             py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"),

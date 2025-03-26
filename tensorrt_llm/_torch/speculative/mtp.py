@@ -1,14 +1,15 @@
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 from torch import nn
 
+from tensorrt_llm.bindings.executor import FinishReason
+
 from ..attention_backend import AttentionMetadata
 from ..pyexecutor.decoder import TorchDecoder
-from ..pyexecutor.llm_request import *
-from ..pyexecutor.llm_request import LlmRequest
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecConfig, SpecMetadata, SpeculativeDecodingMode
 
@@ -35,38 +36,6 @@ class MTPConfig(SpecConfig):
         if model_config.num_nextn_predict_layers == 1:
             self.spec_dec_mode = SpeculativeDecodingMode.MTP_EAGLE
             self.num_extra_kv_tokens = self.num_nextn_predict_layers - 1
-
-
-class SlotManager:
-
-    def __init__(self, max_num_requests: int):
-        self.max_num_requests = max_num_requests
-        self.slot_mapping = dict()
-        self.free_slots = set(range(max_num_requests))
-
-    def get_slot(self, request_id: int):
-        return self.slot_mapping.get(request_id, None)
-
-    def fill_slot_id_tensor(self, requests: List[LlmRequest],
-                            slot_id_tensor: torch.Tensor):
-        for i, request in enumerate(requests):
-            slot_id = self.get_slot(request.request_id)
-            if slot_id is not None:
-                slot_id_tensor[i] = slot_id
-            else:
-                raise ValueError(f"Request {request.request_id} has no slot id")
-
-    def add_slot(self, request_id: int):
-        if len(self.free_slots) == 0:
-            raise ValueError("No free slots")
-        slot = self.free_slots.pop()
-        self.slot_mapping[request_id] = slot
-        return slot
-
-    def remove_slot(self, request_id: int):
-        assert request_id in self.slot_mapping
-        slot = self.slot_mapping.pop(request_id)
-        self.free_slots.add(slot)
 
 
 class MTPHiddenStatesManager(BaseResourceManager):
@@ -211,8 +180,7 @@ class MTPDecoder(TorchDecoder):
         if self._meet_max_token_stop_criteria(request,
                                               num_tokens + self.draft_len):
             request.state = LlmRequestState.GENERATION_COMPLETE
-            request.set_finished_reason(tllm_executor.FinishReason.LENGTH,
-                                        beam_idx)
+            request.set_finished_reason(FinishReason.LENGTH, beam_idx)
 
     def update_requests(self, scheduled_requests: ScheduledRequests,
                         new_tensors_host: Dict[str, torch.Tensor],

@@ -8,7 +8,8 @@ from torch._inductor.pattern_matcher import (CallFunction, Ignored, KeywordArg,
                                              register_replacement)
 
 import tensorrt_llm
-from tensorrt_llm._torch.distributed import AllReduceFusionOp, AllReduceStrategy
+
+from ...distributed import AllReduceFusionOp, AllReduceStrategy
 
 aten = torch.ops.aten
 from tensorrt_llm.mapping import Mapping
@@ -100,7 +101,7 @@ def register_ub_allreduce(custom_pass: PatternMatcherPass):
             residual_in, gamma, mapping.tp_group, eps, scale, mm1_b,
             mm1_b_scale, mm1_bias)
         full_residual = torch.ops.trtllm.userbuffers_allreduce_finalize(
-            all_reduce_output[1])
+            all_reduce_output[1], False)
         return all_reduce_output[0], full_residual
 
     def extra_check(match: Match) -> bool:
@@ -131,7 +132,7 @@ def register_ub_allreduce_finalize(custom_pass: PatternMatcherPass):
     )
     trtllm_userbuffers_allreduce_finalize_default = CallFunction(
         torch.ops.trtllm.userbuffers_allreduce_finalize.default,
-        KeywordArg("sharded_residual"))
+        KeywordArg("sharded_residual"), Ignored())
     trtllm_ub_scaled_mm_allreduce_quant_scaled_mm_op_default = CallFunction(
         torch.ops.trtllm.ub_scaled_mm_allreduce_quant_scaled_mm_op.default,
         KeywordArg("mm0_a"),

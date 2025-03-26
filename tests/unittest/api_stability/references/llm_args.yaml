@@ -99,7 +99,7 @@ methods:
         default: null
         name: iter_stats_max_iterations
       kv_cache_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.KvCacheConfig]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.KvCacheConfig]
         default: null
         name: kv_cache_config
       load_format:
@@ -147,7 +147,7 @@ methods:
         default: false
         name: normalize_log_probs
       peft_cache_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.PeftCacheConfig]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
         default: null
         name: peft_cache_config
       pipeline_parallel_size:
@@ -167,7 +167,7 @@ methods:
         default: null
         name: revision
       scheduler_config:
-        annotation: Optional[tensorrt_llm.bindings.executor.SchedulerConfig]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
         default: null
         name: scheduler_config
       skip_tokenizer_init:
@@ -175,7 +175,7 @@ methods:
         default: false
         name: skip_tokenizer_init
       speculative_config:
-        annotation: Union[tensorrt_llm.bindings.executor.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
+        annotation: Union[tensorrt_llm.llmapi.llm_args.LookaheadDecodingConfig, tensorrt_llm.llmapi.llm_utils.MedusaDecodingConfig,
           tensorrt_llm.llmapi.llm_utils.EagleDecodingConfig, tensorrt_llm.llmapi.MTPDecodingConfig, NoneType]
         default: null
         name: speculative_config

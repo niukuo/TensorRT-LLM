@@ -14,6 +14,7 @@
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
+#include "tensorrt_llm/common/stringUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/disaggServerUtil.h"
@@ -55,10 +56,20 @@ enum class MessageID : uint64_t
 {
     PENDING_CONTEXT_REQUEST = 1,
     PENDING_GENERATION_REQUEST = 2,
-    CONTEXT_RESPONSE = 3,
-    GENERATION_RESPONSE = 4,
+    PENDING_FULL_REQUEST = 3,
+    CONTEXT_RESPONSE = 4,
+    GENERATION_RESPONSE = 5,
 
-    TERMINATION = 5,
+    TERMINATION = 6,
+};
+
+enum DisaggRole : uint32_t
+{
+    DISAGG_CONTEXT = 1,
+    DISAGG_GENERATION = 2,
+    DISAGG_MIXED = DISAGG_CONTEXT | DISAGG_GENERATION,
+    DISAGG_LEADER = 4,
+    DISAGG_CONTROLLER = 8,
 };
 
 struct RequestsData
@@ -113,9 +124,7 @@ using MessageData = std::variant<RequestsData, ResponsesData>;
 
 struct Message
 {
-
     MessageID id;
-
     MessageData data;
 };
 
@@ -148,14 +157,12 @@ class DisaggExecutorLeader
 {
 public:
     DisaggExecutorLeader(std::filesystem::path const& modelPath, ModelType modelType,
-        ExecutorConfig const& executorConfig, bool isController, bool isContext, int numRequests,
+        ExecutorConfig const& executorConfig, bool isController, bool isContext, bool isGeneration, int numRequests,
         std::vector<int>& participatIds, std::vector<int> const& participantDeviceIdsThisInstance, int worldRank)
-        : mIsContext(isContext)
-        , mNumRequests(numRequests)
+        : mNumRequests(numRequests)
         , mWorldRanksInstances(participatIds)
         , mDeviceIdsThisInstance(participantDeviceIdsThisInstance)
         , mWorldRank(worldRank)
-        , mIsLeaderInstance(false)
         , mShutdown(false)
         , mWorldComm(tensorrt_llm::mpi::MpiComm::world())
 
@@ -166,10 +173,24 @@ public:
         auto world_size = mWorldComm.getSize();
         mRolesPerRank.resize(world_size);
 
-        if (!mWorldRanksInstances.empty())
+        if (isContext)
         {
-            mIsLeaderInstance = mWorldRank == mWorldRanksInstances.front();
-        };
+            mRole |= DisaggRole::DISAGG_CONTEXT;
+        }
+        if (isGeneration)
+        {
+            mRole |= DisaggRole::DISAGG_GENERATION;
+        }
+
+        if (!mWorldRanksInstances.empty() && mWorldRank == mWorldRanksInstances.front())
+        {
+            mRole |= DisaggRole::DISAGG_LEADER;
+        }
+
+        if (isController)
+        {
+            mRole |= DisaggRole::DISAGG_CONTROLLER;
+        }
 
         bool needExecutor = (std::find(mWorldRanksInstances.begin(), mWorldRanksInstances.end(), worldRank)
             != mWorldRanksInstances.end());
@@ -189,34 +210,18 @@ public:
             mExecutor = std::make_unique<Executor>(modelPath, modelType, executorConfigC);
         }
 
-        mIsController = false;
-        uint32_t role = 0;
-        if (mIsLeaderInstance)
-        {
-            role |= 0b001;
-        }
-        if (mIsContext)
-        {
-            role |= 0b010;
-        }
-        if (isController)
-        {
-            mIsController = true;
-            role |= 0b100;
-        }
-
         TLLM_CHECK(mWorldRanksInstances.size() == mDeviceIdsThisInstance.size());
 
-        mWorldComm.allgather(&role, mRolesPerRank.data(), 1, tensorrt_llm::mpi::MpiType::kUINT32);
+        mWorldComm.allgather(&mRole, mRolesPerRank.data(), 1, tensorrt_llm::mpi::MpiType::kUINT32);
 
-        generatedRoles();
+        generateRoles();
 
-        if (mIsController)
+        if (isController)
         {
             mControllerSendThread = std::thread(&DisaggExecutorLeader::ControllerSendThread, this);
             mControllerRecvThread = std::thread(&DisaggExecutorLeader::ControllerRecvThread, this);
         }
-        if (mIsLeaderInstance)
+        if (isLeaderInstance())
         {
             mInstanceRecvThread = std::thread(&DisaggExecutorLeader::InstanceLeaderRecvThread, this);
             mInstanceSendThread = std::thread(&DisaggExecutorLeader::InstanceLeaderSendThread, this);
@@ -228,20 +233,36 @@ public:
 #endif
     }
 
-    bool isController() const
+    bool isControllerRank() const
     {
-        return mIsController;
+        return mRole & DISAGG_CONTROLLER;
+    }
+
+    bool isContextRank() const
+    {
+        return mRole & DISAGG_CONTEXT;
+    }
+
+    bool isGenerationRank() const
+    {
+        return mRole & DISAGG_GENERATION;
+    }
+
+    bool isLeaderInstance() const
+    {
+        return mRole & DISAGG_LEADER;
     }
 
     std::vector<IdType> enqueueRequests(std::vector<Request> const& llmRequests)
 
     {
-        if (!mIsController)
+        if (!isControllerRank())
         {
             return {};
         }
 
         std::vector<RequestWithId> requestWithIds;
+        std::vector<RequestWithId> requestWithIdsFull; // full request, not disaggregated
         std::vector<IdType> reqIds;
         for (auto const& req : llmRequests)
         {
@@ -249,16 +270,29 @@ public:
             reqIds.push_back(id);
 
             RequestWithId reqWithId{req, id};
-            reqWithId.req.setRequestType(RequestType::REQUEST_TYPE_CONTEXT_ONLY);
-
-            requestWithIds.push_back(std::move(reqWithId));
+            if (req.getRequestType() == RequestType::REQUEST_TYPE_CONTEXT_ONLY)
+            {
+                requestWithIds.push_back(std::move(reqWithId));
+            }
+            else
+            {
+                TLLM_CHECK(req.getRequestType() == RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION);
+                requestWithIdsFull.push_back(std::move(reqWithId));
+            }
 
             mRequestMap.insert(std::make_pair(id, req));
         }
 
-        Message message{MessageID::PENDING_CONTEXT_REQUEST, MessageData{RequestsData{requestWithIds}}};
-
-        mControllerSendQueue.push(std::move(message));
+        if (!requestWithIds.empty())
+        {
+            Message message{MessageID::PENDING_CONTEXT_REQUEST, MessageData{RequestsData{requestWithIds}}};
+            mControllerSendQueue.push(std::move(message));
+        }
+        if (!requestWithIdsFull.empty())
+        {
+            Message message{MessageID::PENDING_FULL_REQUEST, MessageData{RequestsData{requestWithIdsFull}}};
+            mControllerSendQueue.push(std::move(message));
+        }
 
         return reqIds;
     }
@@ -302,16 +336,6 @@ public:
         return {};
     }
 
-    bool isContextRank() const
-    {
-        return mIsContext;
-    }
-
-    bool isGenerationRank() const
-    {
-        return !mIsContext;
-    }
-
     void shutDown()
     {
         if (mShutdown)
@@ -319,19 +343,24 @@ public:
             return;
         }
 
-        if (mIsController)
+        if (isControllerRank())
         {
             std::call_once(mHasSendTerminFlag,
                 [&]()
                 {
                     MessageID terminationMessage = MessageID::TERMINATION;
+                    std::vector<bool> isSend(mWorldComm.getSize(), false);
                     for (auto&& leaderRanks : {mContextLeaderRanks, mGenerationLeaderRanks})
                     {
                         for (auto&& leaderRank : leaderRanks)
                         {
-
+                            if (isSend[leaderRank])
+                            {
+                                continue;
+                            }
                             mWorldComm.send(&terminationMessage, 1, tensorrt_llm::mpi::MpiType::kUINT64, leaderRank,
                                 kM_CONTROLLER_ID_TAG);
+                            isSend[leaderRank] = true;
                         }
                     }
 
@@ -343,7 +372,7 @@ public:
         mShutdown = true;
 
         // end send thread
-        if (mIsController)
+        if (isControllerRank())
         {
             mControllerSendQueue.push({MessageID::TERMINATION, {}});
         }
@@ -353,12 +382,12 @@ public:
     ~DisaggExecutorLeader()
     {
 
-        if (mIsController)
+        if (isControllerRank())
         {
             shutDown();
         }
 
-        if (mIsLeaderInstance)
+        if (isLeaderInstance())
         {
             if (mInstanceSendThread.joinable())
             {
@@ -374,7 +403,7 @@ public:
             }
         }
 
-        if (mIsController)
+        if (isControllerRank())
         {
             if (mControllerSendThread.joinable())
             {
@@ -386,11 +415,11 @@ public:
             }
         }
 
-        if (!mIsController)
+        if (!isControllerRank())
         {
             mExecutor->shutdown();
         }
-        if (mIsController && mIsLeaderInstance)
+        if (isControllerRank() && isLeaderInstance())
         {
             mExecutor->shutdown();
         }
@@ -399,7 +428,6 @@ public:
     }
 
 private:
-    bool mIsContext;
     tensorrt_llm::mpi::MpiComm const& mWorldComm;
     std::unique_ptr<Executor> mExecutor;
     std::thread mInstanceSendThread;
@@ -417,8 +445,7 @@ private:
 
     int mWorldRank;
     int mControllerRank = 0;
-    bool mIsController;
-    bool mIsLeaderInstance;
+    uint32_t mRole = 0;
     std::vector<uint32_t> mRolesPerRank;
     std::vector<int> mContextLeaderRanks;
     std::vector<int> mGenerationLeaderRanks;
@@ -452,7 +479,7 @@ private:
         mResponsesCv.notify_all();
     }
 
-    void generatedRoles()
+    void generateRoles()
     {
         int contextNum = 0;
         int genrationNum = 0;
@@ -460,26 +487,28 @@ private:
         for (int rank = 0; rank < mRolesPerRank.size(); rank++)
         {
             uint32_t role = mRolesPerRank[rank];
-            if ((role & 0b001) != 0u)
+            if (role & DISAGG_LEADER)
             {
-                if ((role & 0b010) != 0u)
+                if (role & DISAGG_CONTEXT)
                 {
                     contextNum++;
                     mContextLeaderRanks.push_back(rank);
                 }
-                else
+                if (role & DISAGG_GENERATION)
                 {
                     genrationNum++;
                     mGenerationLeaderRanks.push_back(rank);
                 }
             }
-            if ((role & 0b100) != 0u)
+            if (role & DISAGG_CONTROLLER)
             {
                 controllerNum++;
                 mControllerRank = rank;
             }
         }
         TLLM_CHECK_WITH_INFO(controllerNum == 1, "only one rank is controller but get %d controllerNum", controllerNum);
+        TLLM_LOG_INFO("leader ctx: %s, gen: %s", common::vec2str(mContextLeaderRanks).c_str(),
+            common::vec2str(mGenerationLeaderRanks).c_str());
     }
 
     IdType generatedControlId()
@@ -533,7 +562,8 @@ private:
                 mWorldComm.send(packed.data(), packed.size(), tensorrt_llm::mpi::MpiType::kCHAR, contextRank,
                     kM_CONTROLLER_DATA_TAG);
             }
-            else if (message.id == MessageID::PENDING_GENERATION_REQUEST)
+            else if (message.id == MessageID::PENDING_GENERATION_REQUEST
+                || message.id == MessageID::PENDING_FULL_REQUEST)
             {
 
                 auto& reqWithIds = std::get<RequestsData>(message.data);
@@ -655,7 +685,7 @@ private:
                 TLLM_LOG_DEBUG(
                     "ranK:%d ,size:%d ,isContext:%d... Context or Generation leader get termination message in "
                     "sendQueue***************\n",
-                    mWorldComm.getRank(), mWorldComm.getSize(), int(mIsContext));
+                    mWorldComm.getRank(), mWorldComm.getSize(), int(isContextRank()));
                 break;
             }
             else
@@ -693,13 +723,14 @@ private:
             if (messageId == MessageID::TERMINATION)
             {
                 TLLM_LOG_DEBUG(
-                    "ranK:%d ,size:%d ,isContext:%d ... Context or Generation leader revb termination message in "
+                    "ranK:%d ,size:%d ,isContext:%d ... Context or Generation leader recv termination message in "
                     "InstanceLeaderRecvThread***************\n",
-                    mWorldComm.getRank(), mWorldComm.getSize(), int(mIsContext));
+                    mWorldComm.getRank(), mWorldComm.getSize(), int(isContextRank()));
                 shutDown();
                 break;
             }
-            if (messageId == MessageID::PENDING_CONTEXT_REQUEST || messageId == MessageID::PENDING_GENERATION_REQUEST)
+            if (messageId == MessageID::PENDING_CONTEXT_REQUEST || messageId == MessageID::PENDING_GENERATION_REQUEST
+                || messageId == MessageID::PENDING_FULL_REQUEST)
             {
                 mWorldComm.mprobe(sourceRank, kM_CONTROLLER_DATA_TAG, &msg, &status);
                 MPICHECK(MPI_Get_count(&status, MPI_CHAR, &count));
@@ -710,15 +741,28 @@ private:
                 {
 
                     auto globalReqId = requestWithId.id;
-                    if (mIsContext)
+                    if (isContextRank() && messageId == MessageID::PENDING_CONTEXT_REQUEST)
                     {
-                        TLLM_CHECK(messageId == MessageID::PENDING_CONTEXT_REQUEST);
                         TLLM_CHECK(requestWithId.req.getRequestType() == RequestType::REQUEST_TYPE_CONTEXT_ONLY);
                     }
-                    if (!mIsContext)
+                    else if (isGenerationRank()
+                        && (messageId == MessageID::PENDING_GENERATION_REQUEST
+                            || messageId == MessageID::PENDING_FULL_REQUEST))
                     {
-                        TLLM_CHECK(messageId == MessageID::PENDING_GENERATION_REQUEST);
-                        TLLM_CHECK(requestWithId.req.getRequestType() == RequestType::REQUEST_TYPE_GENERATION_ONLY);
+                        if (messageId == MessageID::PENDING_GENERATION_REQUEST)
+                        {
+                            TLLM_CHECK(requestWithId.req.getRequestType() == RequestType::REQUEST_TYPE_GENERATION_ONLY);
+                        }
+                        else // PENDING_FULL_REQUEST
+                        {
+                            TLLM_CHECK(
+                                requestWithId.req.getRequestType() == RequestType::REQUEST_TYPE_CONTEXT_AND_GENERATION);
+                        }
+                    }
+                    else
+                    {
+                        TLLM_THROW("rank:%d, size:%d InstanceLeaderRecvThread recv Invalid message id:%ld",
+                            mWorldComm.getRank(), mWorldComm.getSize(), static_cast<uint64_t>(messageId));
                     }
                     auto reqId = mExecutor->enqueueRequest(requestWithId.req);
                     {
@@ -754,7 +798,8 @@ private:
             {
                 continue;
             }
-            std::vector<ResponseWithId> responseWithIds;
+            std::vector<ResponseWithId> responseWithIdsContext;
+            std::vector<ResponseWithId> responseWithIdsGeneration;
             for (auto&& response : responses)
             {
                 auto reqId = response.getRequestId();
@@ -764,16 +809,24 @@ private:
                     globalId = mInstanceIdToGlobalId[reqId];
                 }
                 TLLM_CHECK(globalId != 0);
-                responseWithIds.push_back(ResponseWithId{response, globalId});
+                auto const& result = response.getResult();
+                if (result.contextPhaseParams.has_value())
+                {
+                    responseWithIdsContext.emplace_back(response, globalId);
+                }
+                else
+                {
+                    responseWithIdsGeneration.emplace_back(response, globalId);
+                }
             }
 
-            if (mIsContext)
+            if (isContextRank())
             {
-                mInstanceSendQueue.push({MessageID::CONTEXT_RESPONSE, ResponsesData{responseWithIds}});
+                mInstanceSendQueue.push({MessageID::CONTEXT_RESPONSE, ResponsesData{responseWithIdsContext}});
             }
-            if ((!mIsContext))
+            if (isGenerationRank())
             {
-                mInstanceSendQueue.push({MessageID::GENERATION_RESPONSE, ResponsesData{responseWithIds}});
+                mInstanceSendQueue.push({MessageID::GENERATION_RESPONSE, ResponsesData{responseWithIdsGeneration}});
             }
         }
     }

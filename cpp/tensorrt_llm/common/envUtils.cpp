@@ -21,6 +21,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <mutex>
+#include <optional>
+#include <string>
 
 namespace tensorrt_llm::common
 {
@@ -46,6 +48,16 @@ std::optional<size_t> getUInt64Env(char const* name)
     size_t const val = std::stoull(env);
     return {val};
 };
+
+std::optional<std::string> getStrEnv(char const* name)
+{
+    char const* const env = std::getenv(name);
+    if (env == nullptr)
+    {
+        return std::nullopt;
+    }
+    return std::string(env);
+}
 
 // Returns true if the env variable exists and is set to "1"
 static bool getBoolEnv(char const* name)
@@ -217,6 +229,12 @@ int getEnvMmhaKernelBlockSize()
     return mmhaKernelBlockSize;
 }
 
+bool getEnvUseTileSizeKv64ForTrtllmGen()
+{
+    static bool const useTileSizeKv64 = getBoolEnv("TRTLLM_GEN_ENABLE_TILE_SIZE_KV64");
+    return useTileSizeKv64;
+}
+
 bool getEnvEnablePDL()
 {
     static std::once_flag flag;
@@ -329,6 +347,12 @@ size_t getEnvAllReduceWorkspaceSize()
     static size_t const workspaceSize
         = getUInt64Env("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE").value_or(1000 * 1000 * 1000);
     return workspaceSize;
+}
+
+std::string getEnvKVCacheTransferOutputPath()
+{
+    static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
+    return outputPath;
 }
 
 bool getEnvKVCacheTransferUseAsyncBuffer()

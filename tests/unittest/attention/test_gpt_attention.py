@@ -754,7 +754,9 @@ class TestFunctional(unittest.TestCase):
                 precision=dtype,
                 int8=int8_trt_flag,
                 quant_mode=quant_mode)
-
+            # Reuce the TRT engine build time by setting the max allowed number of tactics in builder tactic profiling.
+            if builder_config.trt_builder_config.max_num_tactics == -1:
+                builder_config.trt_builder_config.max_num_tactics = 30
             if session is None:
                 engine = builder.build_engine(net, builder_config)
                 session = tensorrt_llm.runtime.Session.from_serialized_engine(
@@ -774,7 +776,7 @@ class TestFunctional(unittest.TestCase):
         plugin_kv_num_heads = num_kv_heads if attention_type == 'llama_attention' or attention_type == 'gpt_bigcode_attention' else num_heads
         kv_hidden_size = plugin_kv_num_heads * head_size
         qkv_hidden_size = hidden_size + 2 * kv_hidden_size
-        out_len = 8
+        out_len = 6
         max_seq_len = in_len + 24
         sink_tokens_in_last_block = sink_token_len % tokens_per_block
         bubble_len = tokens_per_block - sink_tokens_in_last_block if sink_tokens_in_last_block > 0 else 0

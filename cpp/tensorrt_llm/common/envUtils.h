@@ -38,6 +38,9 @@ std::optional<bool> getEnvEnableXQAJIT();
 // 0 means to use heuristics.
 std::optional<int32_t> getEnvXqaBlocksPerSequence();
 
+// Whether use tileSizeKv64 for multiCtasKvMode of trtllm-gen kernels.
+bool getEnvUseTileSizeKv64ForTrtllmGen();
+
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug();
 
@@ -63,6 +66,8 @@ bool getEnvRequestKVCacheSerial();
 bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvDisableReceiveKVCacheParallel();
+
+std::string getEnvKVCacheTransferOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 
