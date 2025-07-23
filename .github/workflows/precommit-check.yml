@@ -55,7 +55,9 @@ jobs:
       - name: PR title format
         if: steps.check-pr-title.outcome == 'failure'
         run: |
-          echo "PR title: [JIRA ticket(JIRA-1234)/NVBugs ID(https://nvbugs/1234)/GitHub issue(#1234)][fix/feat/doc/infra/...] <summary of this PR>"
+          echo "PR title format check failed"
+          echo "PR title format:"
+          echo "[JIRA ticket(JIRA-1234)/NVBugs ID(https://nvbugs/1234)/GitHub issue(#1234)][fix/feat/doc/infra/...] <summary of this PR>"
           echo "e.g. [JIRA-1234][fix] some summary"
           echo "e.g. [https://nvbugs/1234][feat] some summary"
           echo "e.g. [#1234][doc] some summary"
