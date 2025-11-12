@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/yitengn/dev']) _
 
 import java.lang.Exception
 import groovy.transform.Field
@@ -175,8 +175,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
     }
     def nodeLabelPrefix = "cpu"
     def jobName = "llm-build-images"
-    def buildID = env.BUILD_ID
-    def nodeLabel = trtllm_utils.appendRandomPostfix("${nodeLabelPrefix}---tensorrt-${jobName}-${buildID}")
+    def nodeLabel = trtllm_utils.getNodeLabel(nodeLabelPrefix, jobName)
     def podConfig = [
         cloud: targetCould,
         namespace: "sw-tensorrt",
