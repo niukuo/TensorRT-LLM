@@ -160,6 +160,21 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
     if run_ray:
         command += ["--run-ray"]
 
+    s3_upload_path = request.config.getoption("--s3-upload-path", default=None)
+    if s3_upload_path and output_dir:
+        inner_upload_path = f"{s3_upload_path}/{case_fn}"
+        command += [
+            "-s",
+            f"--output-dir={output_dir}",
+            f"--s3-upload-path={inner_upload_path}",
+            f"--s3-endpoint={request.config.getoption('--s3-endpoint')}",
+            f"--s3-username={request.config.getoption('--s3-username')}",
+            f"--s3-bucket={request.config.getoption('--s3-bucket')}",
+        ]
+        s3_secret = request.config.getoption("--s3-secret-key")
+        if s3_secret:
+            command += [f"--s3-secret-key={s3_secret}"]
+
     command += arg_list
 
     print(f"Running unit test:\"python {' '.join(command)}\"")

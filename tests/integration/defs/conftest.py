@@ -37,6 +37,7 @@ import torch
 import tqdm
 import yaml
 from _pytest.mark import ParameterSet
+from test_common import s3_output
 
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.llmapi.mpi_session import get_mpi_world_size
@@ -2047,6 +2048,7 @@ def get_device_memory():
 
 
 def pytest_addoption(parser):
+    s3_output.add_options(parser)
     parser.addoption(
         "--test-list",
         "-F",
@@ -2324,6 +2326,8 @@ def pytest_configure(config):
         print_warning(
             "Warning: --periodic-junit requires --output-dir to be set. "
             "Periodic reporting disabled.")
+
+    s3_output.register_plugin(config)
 
 
 def deselect_by_test_model_suites(test_model_suites, items, test_prefix,
