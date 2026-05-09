@@ -48,7 +48,7 @@ jobs:
         with:
           ref: ${{ github.event.pull_request.merge_commit_sha }}
           lfs: false
-          fetch-depth: 1
+          fetch-depth: 2
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Install git-lfs
