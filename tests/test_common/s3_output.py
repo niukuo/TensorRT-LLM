@@ -229,18 +229,20 @@ class UploadLogPlugin:
                 fd_kwargs["timestamp_format"] = timestamp_format
 
             state["stdout_redir"] = FDRedirector(
-                1, stdout_file, echo_to_original=self.echo_to_stdout, **fd_kwargs)
+                1, stdout_file, echo_to_original=self.echo_to_stdout, **fd_kwargs
+            )
             state["stdout_redir"].__enter__()
             state["stderr_redir"] = FDRedirector(
-                2, stderr_file, echo_to_original=self.echo_to_stdout, **fd_kwargs)
+                2, stderr_file, echo_to_original=self.echo_to_stdout, **fd_kwargs
+            )
             state["stderr_redir"].__enter__()
             state["log_cm"] = catching_logs(handler)
             state["log_cm"].__enter__()
             return state
         except Exception as e:
             logger.warning(
-                "S3 capture setup failed for %r: %s; running without capture",
-                item.nodeid, e)
+                "S3 capture setup failed for %r: %s; running without capture", item.nodeid, e
+            )
             self._close_capture(state)
             return None
 
