@@ -161,6 +161,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         command += ["--run-ray"]
 
     s3_upload_path = request.config.getoption("--s3-upload-path", default=None)
+    s3_secret = None
     if s3_upload_path and output_dir:
         inner_upload_path = f"{s3_upload_path}/{case_fn}"
         command += [
@@ -171,9 +172,9 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             f"--s3-username={request.config.getoption('--s3-username')}",
             f"--s3-bucket={request.config.getoption('--s3-bucket')}",
         ]
+        # Forward the secret via env so it is not written to subprocess logs
+        # or visible in `ps`. The inner pytest reads S3_SECRET_KEY via EnvDefault.
         s3_secret = request.config.getoption("--s3-secret-key")
-        if s3_secret:
-            command += [f"--s3-secret-key={s3_secret}"]
 
     command += arg_list
 
@@ -185,6 +186,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             env = {'PYTHONPATH': f"{llm_root}/tests/unittest:{pythonpath}"}
             if num_workers > 1:
                 env['TORCHINDUCTOR_COMPILE_THREADS'] = '1'
+            if s3_secret:
+                env['S3_SECRET_KEY'] = s3_secret
             llm_venv.run_cmd(
                 cmd,
                 cwd=test_root,

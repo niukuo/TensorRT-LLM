@@ -16,6 +16,7 @@ import argparse
 import logging
 import os
 import re
+import sys
 import threading
 from datetime import datetime
 
@@ -58,6 +59,17 @@ class FDRedirector:
         self._reader_thread = None
 
     def __enter__(self):
+        # Drain any pending buffered writes to the current target fd before we
+        # redirect it. sys.stdout/sys.stderr are block-buffered when connected
+        # to a pipe; without this, late flushes (e.g. of a previous test's
+        # post-teardown print) would land in this test's file after we swap
+        # the underlying fd.
+        for stream in (sys.stdout, sys.stderr):
+            try:
+                stream.flush()
+            except Exception:
+                pass
+
         log_file = open(self.log_file_path, "w", encoding="utf-8", buffering=1)
         pipe_read, pipe_write = os.pipe()
         self.saved_fd = os.dup(self.target_fd)
@@ -115,14 +127,22 @@ class FDRedirector:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self.saved_fd is not None:
+            # Restore the original fd binding. This also closes the previous
+            # binding (our pipe's write end), so the reader thread will see
+            # EOF and finish draining.
             os.dup2(self.saved_fd, self.target_fd)
-            os.close(self.saved_fd)
-            self.saved_fd = None
+            # NB: keep self.saved_fd valid until the reader thread joins;
+            # the reader may still drain pending bytes and want to echo them
+            # through saved_fd. Closing it here would race with that write.
 
         if self._reader_thread:
             self._reader_thread.join(timeout=5.0)
             if self._reader_thread.is_alive():
                 logger.warning(f"Reader thread for FD {self.target_fd} did not exit in time")
+
+        if self.saved_fd is not None:
+            os.close(self.saved_fd)
+            self.saved_fd = None
 
         return False
 
@@ -136,18 +156,27 @@ class UploadLogPlugin:
         bucket,
         upload_path,
         output_path,
+        echo_to_stdout=False,
     ):
         self.upload_path = upload_path
         self.output_path = output_path
         self.bucket = bucket
         self.endpoint_url = endpoint_url
         self.aws_access_key_id = aws_access_key_id
+        self.echo_to_stdout = echo_to_stdout
         self.s3 = boto3.client(
             "s3",
             endpoint_url=endpoint_url,
             aws_access_key_id=aws_access_key_id,
             aws_secret_access_key=aws_secret_access_key,
         )
+        # nodeid -> dict of open capture context managers + handler.
+        # Capture must span setup + call (so fixture output is recorded) but
+        # not teardown — closing the capture before teardown lets us upload
+        # files synchronously inside pytest_runtest_logreport(teardown), where
+        # `report.sections.append(...)` is still seen by the junitxml plugin
+        # (pluggy LIFO order makes our handler fire before junitxml's).
+        self._active_capture: dict = {}
 
     def normalize_test_name(self, nodeid):
         import hashlib
@@ -159,8 +188,13 @@ class UploadLogPlugin:
             test_name = test_name[:200]
         return f"{test_name}-{suffix}"
 
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_call(self, item):
+    def _open_capture(self, item):
+        """Open FDRedirector + logging capture for ``item``.
+
+        Returns a state dict on success, or ``None`` if setup failed (in which
+        case the test runs uncaptured). Never propagates exceptions.
+        """
+        state = {}
         try:
             test_name = self.normalize_test_name(item.nodeid)
             output_path = os.path.join(self.output_path, test_name)
@@ -180,16 +214,13 @@ class UploadLogPlugin:
                     timestamp_format = match.group(1)
 
             handler = logging.FileHandler(log_file)
-
-            # Get logging plugin from config
             logging_plugin = item.config.pluginmanager.getplugin("logging-plugin")
             if logging_plugin is not None:
-                # Create handler for capturing logs
                 handler.setFormatter(logging_plugin.formatter)
-            else:
-                if log_format:
-                    formatter = logging.Formatter(log_format, datefmt=log_date_format)
-                    handler.setFormatter(formatter)
+            elif log_format:
+                formatter = logging.Formatter(log_format, datefmt=log_date_format)
+                handler.setFormatter(formatter)
+            state["handler"] = handler
 
             fd_kwargs = {}
             if log_date_format:
@@ -197,22 +228,55 @@ class UploadLogPlugin:
             if timestamp_format:
                 fd_kwargs["timestamp_format"] = timestamp_format
 
+            state["stdout_redir"] = FDRedirector(
+                1, stdout_file, echo_to_original=self.echo_to_stdout, **fd_kwargs)
+            state["stdout_redir"].__enter__()
+            state["stderr_redir"] = FDRedirector(
+                2, stderr_file, echo_to_original=self.echo_to_stdout, **fd_kwargs)
+            state["stderr_redir"].__enter__()
+            state["log_cm"] = catching_logs(handler)
+            state["log_cm"].__enter__()
+            return state
         except Exception as e:
             logger.warning(
-                "S3 capture setup failed for %r: %s; running without capture", item.nodeid, e
-            )
-            yield
-            return
+                "S3 capture setup failed for %r: %s; running without capture",
+                item.nodeid, e)
+            self._close_capture(state)
+            return None
 
-        try:
-            with (
-                FDRedirector(1, stdout_file, **fd_kwargs),
-                FDRedirector(2, stderr_file, **fd_kwargs),
-                catching_logs(handler),
-            ):
-                yield
-        finally:
-            handler.close()
+    def _close_capture(self, state):
+        """Close capture state opened by ``_open_capture``. Never raises."""
+        if not state:
+            return
+        # Close in reverse order so fd 1/2 are restored before logging stops.
+        for key in ("log_cm", "stderr_redir", "stdout_redir"):
+            cm = state.get(key)
+            if cm is None:
+                continue
+            try:
+                cm.__exit__(None, None, None)
+            except Exception as e:
+                logger.warning("Error closing %s capture: %s", key, e)
+        handler = state.get("handler")
+        if handler is not None:
+            try:
+                handler.close()
+            except Exception:
+                pass
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_setup(self, item):
+        state = self._open_capture(item)
+        if state is not None:
+            self._active_capture[item.nodeid] = state
+        yield
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_teardown(self, item, nextitem):
+        # Stop capturing BEFORE teardown runs, so the captured log files are
+        # final by the time we upload in pytest_runtest_logreport(teardown).
+        self._close_capture(self._active_capture.pop(item.nodeid, None))
+        yield
 
     def get_file_size(self, path):
         try:
@@ -250,8 +314,6 @@ class UploadLogPlugin:
                     f"{filesize} bytes uploaded to {fileurl}",
                 )
             )
-            # Print URL to stdout so it appears in any outer captured log
-            print(f"[S3] {section_name}: {fileurl}")
         except Exception as e:
             logger.warning(
                 f"Upload failed. test_name: {test_name}, filename: {filename}, error: {e}"
@@ -273,6 +335,10 @@ class UploadLogPlugin:
     def pytest_runtest_logreport(self, report):
         if report.when == "teardown":
             test_name = self.normalize_test_name(report.nodeid)
+            # Upload synchronously here so that report.sections.append(URL)
+            # below is visible to the junitxml plugin's logreport handler.
+            # Pluggy hook order is LIFO; this plugin is registered after
+            # junitxml, so our handler runs first.
             self.upload_and_report(report, test_name, "stdout.log", "Captured stdout")
             self.upload_and_report(report, test_name, "stderr.log", "Captured stderr")
             self.upload_and_report(report, test_name, "logging.log", "Captured log")
@@ -315,6 +381,17 @@ def add_options(parser):
         required=False,
         help="s3 upload path",
     )
+    parser.addoption(
+        "--s3-echo-stdout",
+        action="store_true",
+        default=False,
+        help="Besides capturing stdout/stderr to per-test log files, also echo "
+        "them through to the original stdout/stderr (e.g. so progress stays "
+        "visible in the CI console). Should be set on the outer pytest "
+        "invocation; nested pytest invocations spawned by individual tests "
+        "should NOT set this, to avoid duplicating their output back through "
+        "the outer pipe.",
+    )
 
 
 def register_plugin(config):
@@ -338,5 +415,6 @@ def register_plugin(config):
         bucket=config.getoption("--s3-bucket"),
         upload_path=s3_upload_path,
         output_path=output_dir,
+        echo_to_stdout=config.getoption("--s3-echo-stdout", default=False),
     )
     config.pluginmanager.register(plugin, "upload_log_plugin")
