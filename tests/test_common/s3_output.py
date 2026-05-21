@@ -94,22 +94,27 @@ class FDRedirector:
                 if not chunk:
                     break
 
-                output_parts = []
-                for char in chunk:
-                    if need_timestamp:
-                        now = datetime.now()
-                        format_dict = {
-                            "asctime": now.strftime(self.date_format),
-                            "msecs": now.microsecond // 1000,
-                        }
-                        ts_str = self.timestamp_format % format_dict
-                        output_parts.append(f"[{ts_str}] ")
-                        need_timestamp = False
-                    output_parts.append(char)
-                    if char == "\n":
-                        need_timestamp = True
+                # Build the timestamp prefix once per chunk and reuse it for every
+                # line in that chunk. The previous implementation walked the chunk
+                # char-by-char in Python, which was the bottleneck under high-volume
+                # output (e.g. tqdm progress bars, repetitive kernel info logs).
+                # Within a single 4 KiB chunk the timestamp would have been
+                # identical anyway (the reader processes the chunk under the GIL),
+                # so reusing one prefix is semantics-preserving.
+                now = datetime.now()
+                ts_str = self.timestamp_format % {
+                    "asctime": now.strftime(self.date_format),
+                    "msecs": now.microsecond // 1000,
+                }
+                prefix = f"[{ts_str}] "
 
-                log_file.write("".join(output_parts))
+                parts = []
+                for line in chunk.splitlines(keepends=True):
+                    if need_timestamp:
+                        parts.append(prefix)
+                    parts.append(line)
+                    need_timestamp = line.endswith("\n")
+                log_file.write("".join(parts))
                 log_file.flush()
 
                 if self.echo_to_original and self.saved_fd is not None:
