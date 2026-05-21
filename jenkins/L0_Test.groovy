@@ -1086,6 +1086,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         "-s",
                         "--s3-upload-path=${uploadPath}/${stageName}",
                         "--s3-echo-stdout",
+                        "--s3-skip-upload",
                     ]
                 }
                 def pytestCommand = getPytestBaseCommandLine(
@@ -3066,6 +3067,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 "-s",
                 "--s3-upload-path=${uploadPath}/${stageName}",
                 "--s3-echo-stdout",
+                "--s3-skip-upload",
             ]
         }
         def pytestCommand = getPytestBaseCommandLine(

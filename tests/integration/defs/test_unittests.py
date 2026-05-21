@@ -172,6 +172,8 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             f"--s3-username={request.config.getoption('--s3-username')}",
             f"--s3-bucket={request.config.getoption('--s3-bucket')}",
         ]
+        if request.config.getoption("--s3-skip-upload", default=False):
+            command += ["--s3-skip-upload"]
         # Forward the secret via env so it is not written to subprocess logs
         # or visible in `ps`. The inner pytest reads S3_SECRET_KEY via EnvDefault.
         s3_secret = request.config.getoption("--s3-secret-key")

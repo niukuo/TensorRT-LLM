@@ -157,6 +157,7 @@ class UploadLogPlugin:
         upload_path,
         output_path,
         echo_to_stdout=False,
+        skip_upload=False,
     ):
         self.upload_path = upload_path
         self.output_path = output_path
@@ -164,6 +165,7 @@ class UploadLogPlugin:
         self.endpoint_url = endpoint_url
         self.aws_access_key_id = aws_access_key_id
         self.echo_to_stdout = echo_to_stdout
+        self.skip_upload = skip_upload
         self.s3 = boto3.client(
             "s3",
             endpoint_url=endpoint_url,
@@ -295,20 +297,30 @@ class UploadLogPlugin:
         if filesize == 0:
             report.sections.append((section_name, "<empty>"))
             return
+        fileurl = os.path.join(
+            self.endpoint_url,
+            "v1/AUTH_" + self.aws_access_key_id,
+            self.bucket,
+            self.upload_path,
+            test_name,
+            filename,
+        )
+        if self.skip_upload:
+            # Experiment knob: skip the actual S3 upload to measure how much
+            # of this plugin's per-test overhead comes from boto3 network IO.
+            report.sections.append(
+                (
+                    section_name,
+                    f"{filesize} bytes (upload skipped, would upload to {fileurl})",
+                )
+            )
+            return
         try:
             self.s3.upload_file(
                 filepath,
                 self.bucket,
                 os.path.join(self.upload_path, test_name, filename),
                 ExtraArgs={"ContentType": "text/plain"},
-            )
-            fileurl = os.path.join(
-                self.endpoint_url,
-                "v1/AUTH_" + self.aws_access_key_id,
-                self.bucket,
-                self.upload_path,
-                test_name,
-                filename,
             )
             report.sections.append(
                 (
@@ -394,6 +406,15 @@ def add_options(parser):
         "should NOT set this, to avoid duplicating their output back through "
         "the outer pipe.",
     )
+    parser.addoption(
+        "--s3-skip-upload",
+        action="store_true",
+        default=False,
+        help="Experiment knob: still capture stdout/stderr/log per test and "
+        "append URLs to report sections, but skip the actual s3.upload_file "
+        "call. Used to measure how much of the plugin's per-test overhead "
+        "comes from boto3/network IO vs. local capture machinery.",
+    )
 
 
 def register_plugin(config):
@@ -418,5 +439,6 @@ def register_plugin(config):
         upload_path=s3_upload_path,
         output_path=output_dir,
         echo_to_stdout=config.getoption("--s3-echo-stdout", default=False),
+        skip_upload=config.getoption("--s3-skip-upload", default=False),
     )
     config.pluginmanager.register(plugin, "upload_log_plugin")
