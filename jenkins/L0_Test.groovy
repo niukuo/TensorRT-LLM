@@ -99,6 +99,12 @@ TESTER_MEMORY = "96Gi"
 CCACHE_DIR="/mnt/sw-tensorrt-pvc/scratch.trt_ccache/llm_ccache"
 MODEL_CACHE_DIR="/scratch.trt_llm_data/llm-models"
 
+KITMAKER_CREDENTIALS_ID = env.kitmakerCredentialsId ? env.kitmakerCredentialsId : "svc_tensorrt_kitmaker_api_token"
+KITMAKER_DRY_RUN_PIC_EMAIL = env.kitmakerDryRunPicEmail ? env.kitmakerDryRunPicEmail : "kefu@nvidia.com"
+KITMAKER_PUBLISH_TO = env.kitmakerPublishTo ? env.kitmakerPublishTo : "both_devzone_pypi"
+RELEASE_SCRIPT_REPO = env.releaseScriptRepo ? env.releaseScriptRepo.trim() : ""
+RELEASE_SCRIPT_REF = env.releaseScriptRef ? env.releaseScriptRef.trim() : ""
+
 // GPU types that require open driver
 REQUIRED_OPEN_DRIVER_TYPES = ["b100-ts2", "rtx-5080", "rtx-5090", "rtx-pro-6000", "rtx-pro-6000d"]
 
@@ -3451,7 +3457,67 @@ def checkPipInstall(pipeline, wheel_path, version_local)
 }
 
 
-def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", version_local="", cpver="cp312")
+def pythonVersionFromCpver(cpver)
+{
+    if (cpver == "cp310") {
+        return "3.10"
+    }
+    if (cpver == "cp312") {
+        return "3.12"
+    }
+    error "Unsupported Python ABI for Kitmaker dry run: ${cpver}"
+}
+
+
+def runKitmakerWheelDryRun(pipeline, wheel_path, python_bin, publish_to)
+{
+    def wheelUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/${wheel_path}"
+    def releaseScriptsDir = "release-scripts"
+
+    echo "Running Kitmaker wheel dry run for ${wheelUrl} with publish target ${publish_to}"
+    sh "rm -rf ${releaseScriptsDir}"
+    trtllm_utils.checkoutSource(RELEASE_SCRIPT_REPO, RELEASE_SCRIPT_REF, releaseScriptsDir, false, true)
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "${python_bin} -m pip install -r ${releaseScriptsDir}/requirements.txt")
+    def kitmakerDryRun = null
+    withCredentials([string(credentialsId: KITMAKER_CREDENTIALS_ID, variable: 'KITMAKER_API_TOKEN')]) {
+        def resultData = sh(script: """${python_bin} ${releaseScriptsDir}/kitmaker_wheel.py publish \
+            --pic-email ${KITMAKER_DRY_RUN_PIC_EMAIL} \
+            --publish-to ${publish_to} \
+            --size large \
+            --wheel-urls ${wheelUrl} \
+            --no-upload
+        """, returnStdout: true).trim()
+        echo "${resultData}"
+        def resultJson = readJSON text: resultData
+        kitmakerDryRun = [releaseUuid: resultJson["release_uuid"], releaseScriptsDir: releaseScriptsDir, pythonBin: python_bin]
+    }
+    return kitmakerDryRun
+}
+
+
+def isKitmakerWheelDryRunEnabled()
+{
+    return RELEASE_SCRIPT_REPO && RELEASE_SCRIPT_REF
+}
+
+
+def checkKitmakerWheelDryRun(pipeline, kitmakerDryRun)
+{
+    if (!kitmakerDryRun?.releaseUuid) {
+        return
+    }
+    echo "Checking Kitmaker wheel dry run ${kitmakerDryRun.releaseUuid}"
+    withCredentials([string(credentialsId: KITMAKER_CREDENTIALS_ID, variable: 'KITMAKER_API_TOKEN')]) {
+        sh """${kitmakerDryRun.pythonBin} ${kitmakerDryRun.releaseScriptsDir}/kitmaker_wheel.py check \
+            ${kitmakerDryRun.releaseUuid} \
+            --wait \
+            --ignore-missing-logs-error
+        """
+    }
+}
+
+
+def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="", version_local="", cpver="cp312", plat_name="", kitmaker_dry_run=true)
 {
     sh "pwd && ls -alh"
     sh "env | sort"
@@ -3481,6 +3547,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     if (cpu_arch == AARCH64_TRIPLE) {
         buildArgs += " -a '90-real;100-real;103-real;120-real'"
     }
+    def platNameArg = plat_name ? " --plat-name ${plat_name}" : ""
 
     if (version_local) {
         sh """
@@ -3495,7 +3562,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     }
 
     withCredentials([usernamePassword(credentialsId: "urm-artifactory-creds", usernameVariable: 'CONAN_LOGIN_USERNAME', passwordVariable: 'CONAN_PASSWORD')]) {
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}")
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && python3 scripts/build_wheel.py --use_ccache -G Ninja -j ${BUILD_JOBS} -D 'WARNING_IS_ERROR=ON' ${buildArgs}${platNameArg}")
     }
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
@@ -3504,6 +3571,16 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     def wheelName = sh(returnStdout: true, script: 'cd tensorrt_llm/build && ls -1 *.whl').trim()
     echo "uploading ${wheelName} to ${cpu_arch}/${wheel_path}"
     trtllm_utils.uploadArtifacts("tensorrt_llm/build/${wheelName}",  "${UPLOAD_PATH}/${cpu_arch}/${wheel_path}")
+    def uploadedWheelPath = "${cpu_arch}/${wheel_path}${wheelName}"
+    def kitmakerDryRun = null
+    if (kitmaker_dry_run && version_local) {
+        echo "Skipping Kitmaker wheel dry run for local version '+${version_local}'"
+    } else if (kitmaker_dry_run && !isKitmakerWheelDryRunEnabled()) {
+        echo "Skipping Kitmaker wheel dry run because releaseScriptRepo or releaseScriptRef is not set"
+    } else if (kitmaker_dry_run) {
+        def kitmakerPython = "tensorrt_llm/.venv-${pythonVersionFromCpver(cpver)}/bin/python3"
+        kitmakerDryRun = runKitmakerWheelDryRun(pipeline, uploadedWheelPath, kitmakerPython, KITMAKER_PUBLISH_TO)
+    }
 
     if (reinstall_dependencies) {
         // Test installation in the new environment
@@ -3532,6 +3609,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
             trtllm_utils.uploadArtifacts("${attrDir}/${f}", "${UPLOAD_PATH}/${cpu_arch}/attribution/${wheel_path}${wheelBase}/")
         }
     }
+    checkKitmakerWheelDryRun(pipeline, kitmakerDryRun)
 
     return wheelName
 }
@@ -4276,7 +4354,7 @@ def launchTestJobs(pipeline, testFilter)
     }]]}
 
     // Python version and OS for sanity check
-    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall]
+    // Slots: [buildImage, gpuType, cpuArch, reinstallDependencies, isDlfw, pipInstallImage, extraPytorchInstall, platName]
     x86SanityCheckConfigs = [
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
@@ -4286,6 +4364,7 @@ def launchTestJobs(pipeline, testFilter)
             true,
             DLFW_IMAGE,
             false,
+            'manylinux_2_39_x86_64',
         ],
         "PY310-UB2204": [
             LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
@@ -4295,6 +4374,7 @@ def launchTestJobs(pipeline, testFilter)
             false,
             UBUNTU_22_04_IMAGE,
             true, // Extra install PyTorch CUDA 13.0 package to align with the CUDA version used for building TensorRT LLM wheels.
+            'manylinux_2_28_x86_64',
         ],
         "PY312-UB2404": [
             LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE,
@@ -4304,6 +4384,7 @@ def launchTestJobs(pipeline, testFilter)
             false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
+            'manylinux_2_28_x86_64',
         ],
     ]
 
@@ -4316,6 +4397,7 @@ def launchTestJobs(pipeline, testFilter)
             false,
             UBUNTU_24_04_IMAGE,
             true, // Extra PyTorch CUDA 13.0 install
+            'manylinux_2_39_aarch64',
         ],
         "PY312-DLFW": [
             LLM_DOCKER_IMAGE,
@@ -4325,6 +4407,7 @@ def launchTestJobs(pipeline, testFilter)
             true,
             DLFW_IMAGE,
             false,
+            'manylinux_2_39_aarch64',
         ],
     ]
 
@@ -4380,7 +4463,7 @@ def launchTestJobs(pipeline, testFilter)
             }
 
             buildRunner("[${toStageName(values[1], key)}] Build") {
-                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver)
+                wheelName = runLLMBuild(pipeline, cpu_arch, values[3], "", versionLocal, cpver, values[7])
             }
 
             // TODO: Re-enable the sanity check after updating GPU testers' driver version.
