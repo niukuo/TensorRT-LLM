@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import os
 import time
 from typing import List, Optional, Union
@@ -251,7 +266,6 @@ class WanPipeline(BasePipeline):
             self.vae = load_wan_vae(
                 checkpoint_dir,
                 device,
-                self.pipeline_config.visual_gen_mapping,
                 dtype=self.pipeline_config.torch_dtype,
             )
 
@@ -331,16 +345,14 @@ class WanPipeline(BasePipeline):
 
             if not self.is_wan22_14b:
                 self._apply_teacache_coefficients(WAN_TEACACHE_COEFFICIENTS)
-                self._setup_cache_acceleration()
-            else:
-                if self.pipeline_config.cache_backend == "cache_dit":
-                    self._setup_cache_acceleration()
 
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
 
-        # Wan 2.2 TeaCache after both transformers' post_load_weights (FP8 scales, etc.)
+        # Wan 2.2 TeaCache validation after both transformers' post_load_weights
+        # (FP8 scales, etc.). Cache acceleration itself is enabled by the loader
+        # after torch.compile (see PipelineLoader.load).
         if (
             self.transformer is not None
             and self.transformer_2 is not None
@@ -353,7 +365,6 @@ class WanPipeline(BasePipeline):
                     "teacache.coefficients_2 (high-noise and low-noise stage polynomials). "
                     "There is no built-in coefficient table for Wan 2.2."
                 )
-            self._setup_cache_acceleration()
 
     def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
         with torch.no_grad():
@@ -576,19 +587,21 @@ class WanPipeline(BasePipeline):
             else:
                 current_model = self.transformer
 
-            # Build per-patch 2D timestep for Wan 2.2 TI2V-5B
+            # Build the Wan 2.2 TI2V-5B timestep: per-patch 2D for I2V, per-batch 1D for T2V
             if self.is_wan22_5b:
                 _, ph, pw = self.transformer.config.patch_size
-                nf = latents.shape[2]
-                nh = latents.shape[3] // ph
-                nw = latents.shape[4] // pw
                 if is_i2v:
                     # I2V: timestep 0 for reference image, current_t for noisy frames
                     patch_ts = i2v_first_frame_mask[0, 0, :, ::ph, ::pw] * current_t
                     timestep = patch_ts.flatten().unsqueeze(0).expand(latents.shape[0], -1)
                 else:
-                    # T2V: current_t for all frames
-                    timestep = current_t.reshape(1, 1).expand(latents.shape[0], nf * nh * nw)
+                    # T2V: current_t is uniform across all patches, so keep the
+                    # timestep 1-D per batch. The transformer broadcasts one
+                    # modulation row per batch element instead of embedding
+                    # batch*seq_len identical rows, and a 1-D timestep keeps
+                    # TeaCache's timestep-embedding hook working (diffusers'
+                    # get_timestep_embedding requires a 1-D input).
+                    timestep = current_t.reshape(1).expand(latents.shape[0])
 
             if _vsa_active and _vsa_builder is not None:
                 # latents: [B, C, T_latent, H_latent, W_latent]

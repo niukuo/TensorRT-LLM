@@ -6,6 +6,7 @@ Flow:
 2. Create pipeline via AutoPipeline.from_config() with MetaInit
 3. Load weights with on-the-fly quantization if dynamic_weight_quant=True
 4. Call pipeline.post_load_weights()
+5. Apply runtime LoRA adapters after all post-load hooks finish
 
 Dynamic Quantization:
 - If quant_config specifies FP8/NVFP4 and dynamic_weight_quant=True:
@@ -21,7 +22,6 @@ from typing import TYPE_CHECKING, List, Optional, Union
 import torch
 import torch.distributed as dist
 
-from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm._torch.visual_gen.cute_dsl_kernels.blackwell.video_sparse_attention import (
     CUTE_AVAILABLE,
@@ -180,6 +180,7 @@ class PipelineLoader:
         4. Load transformer weights via pipeline.load_transformer_weights()
         5. Load auxiliary components (VAE, text_encoder)
         6. Call pipeline.post_load_weights()
+        7. Apply runtime LoRA adapters after all post-load hooks finish
 
         Args:
             checkpoint_dir: Local path or HF Hub model ID (uses ``args.model`` if not provided)
@@ -296,6 +297,7 @@ class PipelineLoader:
 
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
+        pipeline._setup_runtime_lora()
 
         if config.torch_compile.enable:
             torch._dynamo.config.cache_size_limit = 128
@@ -303,15 +305,17 @@ class PipelineLoader:
         else:
             logger.info("torch.compile disabled by config")
 
+        # Cache acceleration (TeaCache / Cache-DiT) is enabled AFTER torch.compile
+        # on purpose: Cache-DiT captures references to the transformer block
+        # modules at enable time, while torch_compile() replaces the block lists
+        # with compiled copies. If Cache-DiT were enabled first, it would keep
+        # running the stale eager blocks and torch.compile would contribute
+        # nothing.
+        if getattr(pipeline, "transformer", None) is not None:
+            pipeline._setup_cache_acceleration()
+
         if not skip_warmup:
-            if config.torch_compile.enable_autotune:
-                with autotune(
-                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
-                    skip_dynamic_tuning_buckets=True,
-                ):
-                    pipeline.warmup()
-            else:
-                pipeline.warmup()
+            pipeline.warmup()
             logger.info(f"Warmup completed in {time.time() - t0:.2f}s")
         else:
             logger.info("Warmup skipped (skip_warmup=True)")

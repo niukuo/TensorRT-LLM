@@ -40,6 +40,7 @@ class MoeBackendType(str, Enum):
     DEEPGEMM = "DEEPGEMM"
     DENSEGEMM = "DENSEGEMM"
     MEGAMOE_DEEPGEMM = "MEGAMOE_DEEPGEMM"
+    MEGAMOE_CUTEDSL = "MEGAMOE_CUTEDSL"
 
 
 @dataclass
@@ -85,8 +86,15 @@ def ensure_cute_dsl_importable_for_benchmark() -> None:
 
     class CuteDslFusedMoE:
         @classmethod
-        def can_implement(cls, *_args, **_kwargs):
-            return False, f"CUTLASS DSL is unavailable: {import_error}"
+        def can_implement(cls, p, d):
+            from tensorrt_llm._torch.modules.fused_moe.impl_contract import (
+                MoEEligibility,
+                MoERejectReason,
+            )
+
+            return MoEEligibility.no(
+                MoERejectReason.DEP_MISSING, f"CUTLASS DSL is unavailable: {import_error}"
+            )
 
         def __init__(self, *_args, **_kwargs):
             raise RuntimeError(f"CUTLASS DSL is unavailable: {import_error}")
@@ -122,4 +130,8 @@ def get_backend_class(backend_type: MoeBackendType):
         from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoEDeepGemm
 
         return MegaMoEDeepGemm
+    if backend_type == MoeBackendType.MEGAMOE_CUTEDSL:
+        from tensorrt_llm._torch.modules.fused_moe.mega_moe import MegaMoECuteDsl
+
+        return MegaMoECuteDsl
     raise ValueError(f"unknown MoE backend {backend_type!r}")

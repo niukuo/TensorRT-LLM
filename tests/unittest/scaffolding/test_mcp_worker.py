@@ -26,6 +26,9 @@ from tensorrt_llm.scaffolding.task import (
 )
 from tensorrt_llm.scaffolding.worker import MCPWorker, Worker
 
+pytestmark = pytest.mark.cpu_only
+
+
 # ============================================================
 # MCP Server Definition (based on websearch.py)
 # ============================================================
@@ -190,6 +193,7 @@ class FunctionCall:
 
 class ToolCall:
     def __init__(self, name: str, arguments: dict):
+        self.id = f"call_{name}"
         self.function = FunctionCall(name, arguments)
 
 

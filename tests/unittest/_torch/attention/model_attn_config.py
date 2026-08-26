@@ -52,7 +52,9 @@ elsewhere):
 """
 
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import Literal, Optional
+
+AttentionPhase = Literal["ctx", "gen"]
 
 
 @dataclass(frozen=True)
@@ -68,11 +70,11 @@ class ModelAttnConfig:
     no_cache: bool = False  # bidirectional DiT/encoder (no KV cache)
     is_cross: bool = False  # encoder-decoder cross attention
     # MLA (DeepSeek-style latent attention). For absorbed generation num_kv_heads
-    # is 1 (single latent head); for the up-projected context pass (mla_context)
-    # it is MHA (num_kv_heads == num_heads) with asymmetric K/V (K head_dim =
-    # qk_nope + qk_rope, V head_dim = v_head_dim).
+    # is 1 (single latent head); for the up-projected context pass it is MHA
+    # (num_kv_heads == num_heads) with asymmetric K/V (K head_dim = qk_nope +
+    # qk_rope, V head_dim = v_head_dim).
     is_mla: bool = False
-    mla_context: bool = False  # up-projected MHA context pass (vs absorbed gen)
+    phases: tuple[AttentionPhase, ...] | None = None
     kv_lora_rank: Optional[int] = None
     q_lora_rank: Optional[int] = None
     qk_nope_head_dim: Optional[int] = None
@@ -244,13 +246,6 @@ _STANDARD = [
         "Llama-2-7B, Qwen1.5-7B, DeciLM-7B",
         num_heads=32,
         num_kv_heads=32,
-        head_dim=128,
-    ),
-    ModelAttnConfig(
-        "vila1_5_3b_mha",
-        "VILA1.5-3B LLM",
-        num_heads=20,
-        num_kv_heads=20,
         head_dim=128,
     ),
     ModelAttnConfig(
@@ -492,15 +487,6 @@ _STANDARD = [
         sliding_window=512,
     ),
     ModelAttnConfig(
-        "starcoder2_3b_gqa_swa4096",
-        "StarCoder2-3B",
-        num_heads=24,
-        num_kv_heads=2,
-        head_dim=128,
-        mask="sliding",
-        sliding_window=4096,
-    ),
-    ModelAttnConfig(
         "starcoder2_7b_gqa_swa4096",
         "StarCoder2-7B",
         num_heads=36,
@@ -576,6 +562,7 @@ _MLA = [
         num_heads=128,
         num_kv_heads=1,
         head_dim=192,  # qk_nope+qk_rope
+        phases=("gen",),
         is_mla=True,
         kv_lora_rank=512,
         q_lora_rank=1536,
@@ -590,6 +577,7 @@ _MLA = [
         num_heads=32,
         num_kv_heads=1,
         head_dim=192,
+        phases=("gen",),
         is_mla=True,
         kv_lora_rank=512,
         q_lora_rank=1536,
@@ -604,6 +592,7 @@ _MLA = [
         num_heads=64,
         num_kv_heads=1,
         head_dim=192,
+        phases=("gen",),
         is_mla=True,
         kv_lora_rank=512,
         q_lora_rank=1536,
@@ -620,7 +609,7 @@ _MLA = [
         num_heads=128,
         num_kv_heads=128,
         head_dim=192,
-        mla_context=True,
+        phases=("ctx",),
         is_mla=True,
         kv_lora_rank=512,
         q_lora_rank=1536,
@@ -634,7 +623,7 @@ _MLA = [
         num_heads=32,
         num_kv_heads=32,
         head_dim=192,
-        mla_context=True,
+        phases=("ctx",),
         is_mla=True,
         kv_lora_rank=512,
         q_lora_rank=1536,
@@ -648,7 +637,7 @@ _MLA = [
         num_heads=64,
         num_kv_heads=64,
         head_dim=192,
-        mla_context=True,
+        phases=("ctx",),
         is_mla=True,
         kv_lora_rank=512,
         q_lora_rank=1536,
@@ -813,4 +802,4 @@ _NO_CACHE = [
     ),
 ]
 
-MODEL_CONFIGS: List[ModelAttnConfig] = _STANDARD + _MLA + _CROSS + _NO_CACHE
+MODEL_CONFIGS: list[ModelAttnConfig] = _STANDARD + _MLA + _CROSS + _NO_CACHE

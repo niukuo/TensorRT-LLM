@@ -2,10 +2,13 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Tests for MultimodalRuntimeData cumsum math and the flat-mask producer."""
 
+from unittest.mock import patch
+
 import pytest
 import torch
 
 from tensorrt_llm.inputs.multimodal import (
+    MULTIMODAL_ENCODER_ITEM_METADATA_KEY,
     DisaggPrefillMultimodalInputs,
     MultimodalInput,
     MultimodalRuntimeData,
@@ -13,9 +16,96 @@ from tensorrt_llm.inputs.multimodal import (
     find_mm_token_lengths,
 )
 from tensorrt_llm.inputs.registry import (
+    MultimodalEncoderItemMetadata,
     create_input_processor_with_hash,
     maybe_compute_mm_embed_cumsum,
 )
+
+pytestmark = pytest.mark.cpu_only
+
+
+class _ItemMetadataFakeProcessor:
+    multimodal_hashing_supported = False
+
+    def __init__(self, existing_embedding_lengths):
+        self.existing_embedding_lengths = existing_embedding_lengths
+
+    def __call__(self, inputs, sampling_params):
+        return [101, 102], {
+            "multimodal_data": {
+                "image": {},
+                "multimodal_embedding_lengths": self.existing_embedding_lengths,
+            }
+        }
+
+    def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+        assert prompt_token_ids == [101, 102]
+        assert "image" in multimodal_data
+        return MultimodalEncoderItemMetadata(
+            item_refs=[("image", 0)],
+            encoder_token_lengths=[4],
+            output_embedding_lengths=[2],
+        )
+
+    def get_vocab_size(self):
+        return 100
+
+    def get_mm_token_ids(self):
+        return None
+
+    def get_mm_special_token_ids(self):
+        return None
+
+
+def test_mm_item_metadata_is_materialized_when_embedding_lengths_match():
+    input_processor = create_input_processor_with_hash(_ItemMetadataFakeProcessor([2]))
+
+    _, extra = input_processor({"prompt": "unused"}, sampling_params=None)
+
+    multimodal_data = extra["multimodal_data"]
+    item_metadata = multimodal_data[MULTIMODAL_ENCODER_ITEM_METADATA_KEY]
+    assert item_metadata == MultimodalEncoderItemMetadata(
+        item_refs=[("image", 0)],
+        encoder_token_lengths=[4],
+        output_embedding_lengths=[2],
+    )
+    assert multimodal_data["multimodal_embedding_lengths"] == [2]
+    assert "multimodal_item_refs" not in multimodal_data
+    assert "multimodal_encoder_token_lengths" not in multimodal_data
+
+
+def test_mm_item_metadata_rejects_mismatched_embedding_lengths():
+    input_processor = create_input_processor_with_hash(_ItemMetadataFakeProcessor([1]))
+
+    with pytest.raises(ValueError, match="do not match"):
+        input_processor({"prompt": "unused"}, sampling_params=None)
+
+
+def test_mm_item_metadata_none_falls_back_to_non_item_path():
+    # A processor whose get_mm_encoder_item_metadata returns None does not
+    # participate in item scheduling; routing falls through with no item
+    # metadata attached (no capability flag drives this).
+    class NoMetadataProcessor(_ItemMetadataFakeProcessor):
+        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+            return None
+
+    input_processor = create_input_processor_with_hash(NoMetadataProcessor([2]))
+
+    _, extra = input_processor({"prompt": "unused"}, sampling_params=None)
+
+    assert MULTIMODAL_ENCODER_ITEM_METADATA_KEY not in extra["multimodal_data"]
+
+
+def test_mm_item_metadata_rejects_wrong_return_type():
+    # A non-None, non-metadata return is a genuine contract violation.
+    class BadMetadataProcessor(_ItemMetadataFakeProcessor):
+        def get_mm_encoder_item_metadata(self, prompt_token_ids, multimodal_data):
+            return ("image", 0)
+
+    input_processor = create_input_processor_with_hash(BadMetadataProcessor([2]))
+
+    with pytest.raises(TypeError, match="must return a"):
+        input_processor({"prompt": "unused"}, sampling_params=None)
 
 
 def test_maybe_compute_mm_embed_cumsum_populates_py_multimodal_data():
@@ -102,6 +192,97 @@ def test_tokenized_multimodal_overwrites_stale_embedding_lengths():
 
     assert prompt_token_ids == [10, 101, 102, 200, 103, 20]
     assert extra["multimodal_data"]["multimodal_embedding_lengths"] == [3]
+
+
+class _KwargsHashFakeProcessor:
+    multimodal_hashing_supported = True
+
+    def __call__(self, inputs, sampling_params):
+        return [10, 101, 102, 20], {"multimodal_data": {}}
+
+    def get_num_tokens_per_image(self, *, image):
+        return 2
+
+    def get_vocab_size(self):
+        return 100
+
+    def get_mm_token_ids(self):
+        return None
+
+    def get_mm_special_token_ids(self):
+        return None
+
+
+def test_mm_processor_kwargs_hash_is_stable_for_canonical_values():
+    input_processor = create_input_processor_with_hash(
+        _KwargsHashFakeProcessor(),
+        encoder_cache_enabled=True,
+    )
+    mm_data = {"image": [torch.tensor([1])]}
+
+    _, first = input_processor(
+        {
+            "prompt": "unused",
+            "multi_modal_data": mm_data,
+            "mm_processor_kwargs": {
+                "b": [2, 3],
+                "a": torch.tensor([1]),
+            },
+        },
+        sampling_params=None,
+    )
+    _, second = input_processor(
+        {
+            "prompt": "unused",
+            "multi_modal_data": mm_data,
+            "mm_processor_kwargs": {
+                "a": torch.tensor([1]),
+                "b": [2, 3],
+            },
+        },
+        sampling_params=None,
+    )
+
+    assert first["multimodal_data"]["mm_processor_kwargs_hash"] is not None
+    assert (
+        first["multimodal_data"]["mm_processor_kwargs_hash"]
+        == second["multimodal_data"]["mm_processor_kwargs_hash"]
+    )
+
+
+def test_unserializable_mm_processor_kwargs_disable_persistent_cache_keying():
+    input_processor = create_input_processor_with_hash(
+        _KwargsHashFakeProcessor(),
+        encoder_cache_enabled=True,
+    )
+
+    _, extra = input_processor(
+        {
+            "prompt": "unused",
+            "multi_modal_data": {"image": [torch.tensor([1])]},
+            "mm_processor_kwargs": {"custom": object()},
+        },
+        sampling_params=None,
+    )
+
+    assert extra["multimodal_data"]["mm_processor_kwargs_hash"] is None
+
+
+def test_disabled_encoder_cache_skips_mm_processor_kwargs_hash():
+    input_processor = create_input_processor_with_hash(_KwargsHashFakeProcessor())
+
+    with patch("tensorrt_llm.inputs.registry._hash_mm_processor_kwargs") as kwargs_hash:
+        _, extra = input_processor(
+            {
+                "prompt": "unused",
+                "multi_modal_data": {"image": [torch.tensor([1])]},
+                "mm_processor_kwargs": {"image_sizes": torch.tensor([1, 2])},
+            },
+            sampling_params=None,
+        )
+
+    kwargs_hash.assert_not_called()
+    assert "mm_processor_kwargs_hash" not in extra["multimodal_data"]
 
 
 def test_multimodal_embedding_lengths_exclude_special_tokens():

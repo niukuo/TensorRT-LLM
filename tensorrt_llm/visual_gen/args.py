@@ -46,18 +46,19 @@ CacheBackendName = Literal["teacache", "cache_dit"]
 class QuantAttentionConfig(StrictBaseModel):
     """Attention quantization recipe (TRTLLM / CUTEDSL backends).
 
-    Describes user intent for quantized attention: per-bmm dtype and per-block layout for Q, K, V.
-    Providing this config to AttentionConfig enables quantized attention; setting
-    AttentionConfig.quant_attention_config = None disables it.
+    Specifies Q/K and V quantization formats and their optional block sizes.
 
     Bare QuantAttentionConfig() is a valid Qk16Pv8 recipe.
     Unsupported recipes are rejected by AttentionConfig's validator with a ValueError.
     """
 
-    qk_dtype: Literal["bf16", "int8", "fp8"] = Field(
+    qk_dtype: Literal["bf16", "int8", "fp8", "mxfp8", "nvfp4"] = Field(
         "bf16",
         status="prototype",
-        description="Q/K quantization dtype; bf16 leaves Q/K unquantized.",
+        description=(
+            "Q/K quantization format. bf16 leaves Q/K unquantized; int8 and fp8 use 8-bit "
+            "integer and floating-point element formats; mxfp8 and nvfp4 are block-scaled formats."
+        ),
     )
     v_dtype: Literal["fp8"] = Field(
         "fp8",
@@ -68,19 +69,21 @@ class QuantAttentionConfig(StrictBaseModel):
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for Q; 0 for per-tensor quantization.",
+        description="Number of Q tokens per SageAttention quantization block; 0 otherwise.",
     )
     k_block_size: int = Field(
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for K; 0 for per-tensor quantization.",
+        description="Number of K tokens per SageAttention quantization block; 0 otherwise.",
     )
     v_block_size: int = Field(
         0,
         ge=0,
         status="prototype",
-        description="Elements per quantization block for V; 0 for per-tensor quantization.",
+        description=(
+            "V quantization block size on the hidden dimension; 0 uses one tensor-wide V scale."
+        ),
     )
 
 
@@ -119,7 +122,7 @@ class AttentionConfig(StrictBaseModel):
 
     @model_validator(mode="after")
     def _validate_quant_attention_config(self) -> "AttentionConfig":
-        # SAGE recipes target the TRTLLM backend (per-block Q/K/V scales).
+        # Recipe tuple: (qk_dtype, v_dtype, (q_block, k_block, v_block)).
         SAGE_RECIPES = {
             ("int8", "fp8", (1, 1, 1)),
             ("int8", "fp8", (1, 4, 1)),
@@ -127,9 +130,12 @@ class AttentionConfig(StrictBaseModel):
             ("fp8", "fp8", (1, 1, 1)),
             ("fp8", "fp8", (1, 4, 1)),
         }
-        # QK16PV8 (CUTEDSL backend): Q/K kept in bf16, V quantized to FP8.
-        QK16PV8_DTYPES = {
+        CUTEDSL_RECIPES = {
             ("bf16", "fp8", (0, 0, 0)),
+            ("mxfp8", "fp8", (0, 0, 0)),
+            ("mxfp8", "fp8", (0, 0, 1)),
+            ("nvfp4", "fp8", (0, 0, 0)),
+            ("nvfp4", "fp8", (0, 0, 1)),
         }
 
         if self.quant_attention_config is None:
@@ -150,11 +156,12 @@ class AttentionConfig(StrictBaseModel):
                     f"{sorted(SAGE_RECIPES)}."
                 )
         elif self.backend == "CUTEDSL":
-            if recipe not in QK16PV8_DTYPES:
+            if recipe not in CUTEDSL_RECIPES:
                 raise ValueError(
                     f"Unsupported quant_attention_config={self.quant_attention_config!r} "
-                    f"for backend='CUTEDSL'. Supported (qk_dtype, v_dtype): "
-                    f"{sorted(QK16PV8_DTYPES)}."
+                    f"for backend='CUTEDSL'. Supported recipes "
+                    f"(qk_dtype, v_dtype, (q_block, k_block, v_block)): "
+                    f"{sorted(CUTEDSL_RECIPES)}."
                 )
         else:
             raise ValueError(
@@ -508,6 +515,56 @@ class CompilationConfig(StrictBaseModel):
     )
 
 
+class RuntimeLoRAConfig(StrictBaseModel):
+    """Startup-preloaded LoRA adapter fused into transformer weights."""
+
+    path: str = Field(
+        "",
+        status="prototype",
+        description="Local safetensors file or directory containing LoRA adapter weights.",
+    )
+    scale: float = Field(
+        1.0,
+        status="prototype",
+        description="LoRA adapter strength multiplier applied on top of alpha/rank scaling.",
+    )
+    target_components: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description=(
+            "Transformer component names to patch. Empty is allowed only for "
+            "single-transformer pipelines; multi-transformer pipelines require "
+            "explicit component names."
+        ),
+    )
+    strip_prefixes: List[str] = Field(
+        default_factory=list,
+        status="prototype",
+        description="Extra LoRA key prefixes to strip before matching transformer module names.",
+    )
+    key_map: Dict[str, str] = Field(
+        default_factory=dict,
+        status="prototype",
+        description="Prefix map from LoRA checkpoint module names to TRTLLM module names.",
+    )
+    fuse_qkv: bool = Field(
+        True,
+        status="prototype",
+        description="Map to_q/to_k/to_v LoRA tensors onto fused qkv_proj modules when present.",
+    )
+    strict: bool = Field(
+        True,
+        status="prototype",
+        description="Raise when adapter tensors do not match any target module or expected shapes.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_path(self) -> "RuntimeLoRAConfig":
+        if not self.path:
+            raise ValueError("runtime_lora_config.path must be non-empty")
+        return self
+
+
 # =============================================================================
 # VisualGenArgs - User-facing configuration (CLI / YAML)
 # =============================================================================
@@ -576,6 +633,11 @@ class VisualGenArgs(StrictBaseModel):
         status="prototype",
     )
     cache_config: Optional[CacheConfig] = Field(None, status="prototype")
+    runtime_lora_config: Optional[RuntimeLoRAConfig] = Field(
+        None,
+        status="prototype",
+        description=("Startup-preloaded LoRA adapter fused into VisualGen transformer weights."),
+    )
 
     pipeline_config: Dict[str, Any] = Field(
         default_factory=dict,
@@ -668,5 +730,6 @@ __all__ = [
     "TorchCompileConfig",
     "CudaGraphConfig",
     "CompilationConfig",
+    "RuntimeLoRAConfig",
     "VisualGenArgs",
 ]
