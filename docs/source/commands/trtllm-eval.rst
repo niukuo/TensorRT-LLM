@@ -44,6 +44,16 @@ The following tasks are currently supported:
      - accuracy
      - 1,024
      - 512
+   * - AIME 2025
+     - QA; regex matching
+     - accuracy
+     - 4,096
+     - 32,768
+   * - AIME 2026
+     - QA; regex matching
+     - accuracy
+     - 4,096
+     - 32,768
 
 .. note::
 
@@ -52,13 +62,11 @@ The following tasks are currently supported:
 Usage and Examples
 ------------------
 
-Some evaluation tasks (e.g., GSM8K and GPQA) depend on the ``lm_eval`` package. To run these tasks, you need to install ``lm_eval`` with:
+Some evaluation tasks (e.g., GSM8K and GPQA) depend on the ``lm_eval`` package. To run these tasks, install the version pinned in `requirements-dev.txt <https://github.com/NVIDIA/TensorRT-LLM/blob/main/requirements-dev.txt>`_:
 
 .. code-block:: bash
 
-   pip install -r requirements-dev.txt
-
-Alternatively, you can install the ``lm_eval`` version specified in ``requirements-dev.txt``.
+   pip install "lm_eval[api]==0.4.10"
 
 Here are some examples:
 
@@ -72,6 +80,10 @@ Here are some examples:
 
    # Evaluate Llama-3.3-70B-Instruct on GPQA Diamond
    trtllm-eval --model meta-llama/Llama-3.3-70B-Instruct gpqa_diamond
+
+   # Evaluate a model on AIME 2025 / 2026 (long-CoT math; requires --max_seq_len >= 36864)
+   trtllm-eval --model <model> --max_seq_len 36864 aime25
+   trtllm-eval --model <model> --max_seq_len 36864 aime26
 
 The ``--model`` argument accepts either a Hugging Face model ID or a local checkpoint path. By default, ``trtllm-eval`` runs the model with the PyTorch backend; you can pass ``--backend tensorrt`` to switch to the TensorRT backend.
 

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -21,6 +21,7 @@ different test scripts (perf sanity, module perf, accuracy, etc.).
 import json
 import os
 import re
+import socket
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -38,7 +39,7 @@ _URM_BASE = "https://urm.nvidia.com/artifactory/sw-tensorrt-generic/llm-artifact
 def get_job_info():
     """Get job info from environment variables."""
     # Read environment variables
-    host_node_name = os.getenv("HOST_NODE_NAME", "")
+    host_node_name = os.getenv("HOST_NODE_NAME", "") or socket.gethostname()
     build_id = os.getenv("BUILD_ID", "")
     build_url = os.getenv("BUILD_URL", "")
     job_name = os.getenv("JOB_NAME", "")
@@ -61,14 +62,9 @@ def get_job_info():
     is_post_merge = "PostMerge" in job_url
     is_pr_job = not is_post_merge
 
-    # Extract branch from job_url
-    # Pattern: LLM/job/main/job -> branch is "main"
-    branch = ""
+    raw_branch = global_vars.get("build_branch")
+    branch = raw_branch if isinstance(raw_branch, str) else ""
     commit = os.getenv("gitlabCommit", "")
-    if job_url:
-        branch_match = re.search(r"/job/LLM/job/([^/]+)/job/", job_url)
-        if branch_match:
-            branch = branch_match.group(1)
 
     # Initialize PR-specific fields
     trigger_mr_user = ""
@@ -498,15 +494,24 @@ def process_and_upload_test_results(
             data.update(extra_fields)
         add_id(data)
 
-    # Step 3: Find common values to narrow query scope
-    common_values_dict = get_common_values(new_data_dict, match_keys)
+    # Step 3: For pre-merge, look history up against the baseline branch
+    lookup_data_dict = new_data_dict
+    if not is_post_merge and "s_branch" in match_keys:
+        baseline_branch = os.environ.get("PERF_BASELINE_BRANCH", "main")
+        lookup_data_dict = {
+            cmd_idx: {**data, "s_branch": baseline_branch}
+            for cmd_idx, data in new_data_dict.items()
+        }
 
-    # Step 4: Query history data
+    # Step 4: Find common values to narrow query scope
+    common_values_dict = get_common_values(lookup_data_dict, match_keys)
+
+    # Step 5: Query history data
     latest_history_data_dict, latest_baseline_threshold_dict, history_data_dict = get_history_data(
-        new_data_dict, match_keys, common_values_dict
+        lookup_data_dict, match_keys, common_values_dict
     )
 
-    # Step 5: Compute regression info
+    # Step 6: Compute regression info
     prepare_regressive_test_cases(
         latest_history_data_dict,
         latest_baseline_threshold_dict,
@@ -517,17 +522,17 @@ def process_and_upload_test_results(
         regression_metrics,
     )
 
-    # Step 6: For post-merge, embed baseline fields
+    # Step 7: For post-merge, embed baseline fields
     if is_post_merge:
         add_baseline_fields_to_post_merge_data(
             latest_baseline_threshold_dict, new_data_dict, maximize_metrics, minimize_metrics
         )
 
-    # Step 7: Upload to DB
+    # Step 8: Upload to DB
     if upload_to_db:
         post_new_perf_data(new_data_dict)
 
-    # Step 8: Check regression (auto-detect fail behavior if not specified)
+    # Step 9: Check regression (auto-detect fail behavior if not specified)
     if fail_on_regression is None:
         fail_on_regression = not is_post_merge
     check_perf_regression(new_data_dict, fail_on_regression=fail_on_regression)

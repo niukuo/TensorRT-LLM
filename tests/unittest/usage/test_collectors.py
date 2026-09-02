@@ -17,7 +17,12 @@
 import json
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm.usage import schema, usage_lib
+
+pytestmark = pytest.mark.cpu_only
+
 
 # ---------------------------------------------------------------------------
 # System info tests
@@ -113,8 +118,8 @@ class TestModelInfo:
     def test_extract_architecture_multiple(self):
         """Extracts first architecture when list has multiple entries."""
         mock = MagicMock()
-        mock.architectures = ["Qwen2ForCausalLM", "GPT2LMHeadModel"]
-        assert usage_lib._extract_architecture_class_name(mock) == "Qwen2ForCausalLM"
+        mock.architectures = ["Qwen3ForCausalLM", "GPT2LMHeadModel"]
+        assert usage_lib._extract_architecture_class_name(mock) == "Qwen3ForCausalLM"
 
     def test_extract_architecture_none_config(self):
         """Returns None when config is None."""
@@ -343,6 +348,8 @@ class TestFeatureExtraction:
             "cuda_graphs": False,
             "chunked_context": False,
             "data_parallel_size": 1,
+            "checkpoint_format": "HF",
+            "load_format": "AUTO",
         }
 
     def test_none_llm_args_returns_defaults(self):
@@ -543,7 +550,36 @@ class TestFeatureExtraction:
             "cuda_graphs": True,
             "chunked_context": True,
             "data_parallel_size": 8,
+            "checkpoint_format": "HF",
+            "load_format": "AUTO",
         }
+
+    # --- Checkpoint/load axes ---
+
+    def test_checkpoint_and_load_format_defaults(self):
+        """Checkpoint/load formats default to effective HF/AUTO baseline."""
+        mock = MagicMock(spec=[])
+        result = json.loads(usage_lib._collect_features(mock))
+        assert result["checkpoint_format"] == "HF"
+        assert result["load_format"] == "AUTO"
+
+    def test_checkpoint_and_load_format_explicit_strings(self):
+        """Checkpoint/load format string values are captured directly."""
+        mock = MagicMock()
+        mock.checkpoint_format = "MX"
+        mock.load_format = "GMS"
+        result = json.loads(usage_lib._collect_features(mock))
+        assert result["checkpoint_format"] == "MX"
+        assert result["load_format"] == "GMS"
+
+    def test_checkpoint_and_load_format_enums(self):
+        """Enum-like objects are captured via their ``name`` attribute."""
+        mock = MagicMock()
+        mock.checkpoint_format = None
+        mock.load_format.name = "AUTO"
+        result = json.loads(usage_lib._collect_features(mock))
+        assert result["checkpoint_format"] == "HF"
+        assert result["load_format"] == "AUTO"
 
     # --- Output format ---
 

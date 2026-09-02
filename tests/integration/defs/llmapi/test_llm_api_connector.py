@@ -49,11 +49,14 @@ def model_with_connector():
         def model_fn(*args, **kwargs):
 
             default_kwargs = {
-                "model": f"{llm_models_root()}/Qwen2-0.5B",
+                "model": f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
                 "backend": "pytorch",
                 "kv_connector_config": kv_connector_config,
                 "cuda_graph_config": None,
-                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1)
+                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1),
+                # Connector tests use at most 256 input tokens. Keep model
+                # construction independent of the GPU's available KV capacity.
+                "max_seq_len": 1024,
             }
 
             return LLM(*args, **{**default_kwargs, **kwargs})
@@ -543,6 +546,40 @@ def test_connector_priorities_default(enforce_single_worker,
 
 
 @pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize(
+    "llm_kwargs,match",
+    [
+        pytest.param(
+            dict(kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1,
+                                               host_cache_size=1024**3)),
+            "host",
+            id="host_offloading",
+        ),
+        pytest.param(
+            dict(max_beam_width=2),
+            "beam",
+            id="beam_search",
+        ),
+        pytest.param(
+            dict(enable_attention_dp=True),
+            "attention data parallelism",
+            id="attention_dp",
+        ),
+    ],
+)
+def test_connector_rejects_unsupported_config(enforce_single_worker,
+                                              model_with_connector, llm_kwargs,
+                                              match):
+    # Configurations the connector cannot handle today must fail loudly at
+    # construction time rather than silently miscompute. This pins the set of
+    # constructor-time exclusions in `_maybe_init_kv_connector_manager`.
+    model_fn, _, _ = model_with_connector
+
+    with pytest.raises(NotImplementedError, match=match):
+        model_fn(**llm_kwargs)
+
+
+@pytest.mark.threadleak(enabled=False)
 def test_connector_e2e_persistent_cache(enforce_single_worker):
     """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
 
@@ -566,7 +603,7 @@ def test_connector_e2e_persistent_cache(enforce_single_worker):
         )
 
         llm_kwargs = dict(
-            model=f"{llm_models_root()}/Qwen2-0.5B",
+            model=f"{llm_models_root()}/Qwen3/Qwen3-0.6B",
             backend="pytorch",
             kv_connector_config=kv_connector_config,
             cuda_graph_config=None,

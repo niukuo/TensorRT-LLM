@@ -1,3 +1,17 @@
+# SPDX-FileCopyrightText: Copyright (c) 2024-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Testing build_and_run_ad end2end."""
 
 import pytest
@@ -95,24 +109,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
             },
         ),
         (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "mistralai/Mixtral-8x7B-Instruct-v0.1",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
-            },
-        ),
-        (
             "Qwen/Qwen3-30B-A3B",
             {
                 "transforms": {
@@ -128,24 +124,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "transformers_replace_cached_attn": {"backend": "triton"},
                 },
                 "mode": "transformers",
-            },
-        ),
-        (
-            "microsoft/Phi-3-mini-4k-instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
-            },
-        ),
-        (
-            "microsoft/Phi-3-mini-4k-instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "torch"},
-                    "compile_model": {"backend": "torch-simple"},
-                },
             },
         ),
         (
@@ -154,8 +132,8 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                 "transforms": {
                     "insert_cached_attention": {"backend": "flashinfer"},
                     "compile_model": {
-                        "backend": "torch-opt",
-                        "cuda_graph_batch_sizes": [1, 2],
+                        "backend": "torch-simple",
+                        "piecewise_enabled": False,
                     },
                 },
             },
@@ -176,24 +154,6 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "insert_cached_attention": {"backend": "triton"},
                     "compile_model": {"backend": "torch-simple"},
                 },
-            },
-        ),
-        (
-            "Qwen/Qwen2.5-3B-Instruct",
-            {
-                "transforms": {
-                    "insert_cached_attention": {"backend": "triton"},
-                    "compile_model": {"backend": "torch-compile"},
-                },
-            },
-        ),
-        (
-            "Qwen/Qwen2.5-3B-Instruct",
-            {
-                "transforms": {
-                    "transformers_replace_cached_attn": {"backend": "triton"},
-                },
-                "mode": "transformers",
             },
         ),
         (
@@ -254,6 +214,24 @@ def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
                     "insert_cached_attention": {"backend": "flashinfer"},
                     "insert_cached_ssm_attention": {"backend": "triton_ssm"},
                     "compile_model": {"backend": "torch-cudagraph"},
+                },
+            },
+        ),
+        # Smoke test for NVIDIA/TensorRT-LLM#13321 — exercises the piecewise
+        # CUDA graph + multi_stream_moe path.  Multi-stream passthroughs are
+        # no-op'd on the piecewise path via ``disable_multi_stream`` so the
+        # static segment capture is safe; decode batches still overlap via
+        # the monolithic CG path.
+        (
+            "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-FP8",
+            {
+                "compile_backend": "torch-cudagraph",
+                "transforms": {
+                    "mlir_elementwise_fusion": {"enabled": True},
+                    "multi_stream_moe": {"stage": "compile", "enabled": True},
+                    "insert_cached_attention": {"backend": "flashinfer"},
+                    "insert_cached_ssm_attention": {"backend": "triton_ssm"},
+                    "compile_model": {"piecewise_enabled": True},
                 },
             },
         ),

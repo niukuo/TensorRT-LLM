@@ -18,11 +18,7 @@ These examples show how to interact with the visual generation server using both
 
 Before running these examples, ensure you have:
 
-1. **Install modules**: Install required dependencies before running examples:
-
-   ```bash
-   pip install "diffusers>=0.37.0"
-   ```
+1. **Install modules**: Install optional dependency:
 
    **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
    ```bash
@@ -33,20 +29,21 @@ Before running these examples, ensure you have:
 
 2. **Server Running**: The TensorRT-LLM visual generation server must be running
    ```bash
-   trtllm-serve <path to your model> --extra_visual_gen_options <path to config yaml>
+   trtllm-serve <path to your model> --visual_gen_args <path to config yaml>
    ```
 
    e.g.
 
    ```bash
-   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan21.yml
-   trtllm-serve $LLM_MODEL_DIR/Wan2.2-T2V-A14B-Diffusers --extra_visual_gen_options ./configs/wan22.yml
-   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
-   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
-   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --extra_visual_gen_options ./configs/ltx2.yml
+   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml
+   trtllm-serve $LLM_MODEL_DIR/Wan2.2-T2V-A14B-Diffusers --visual_gen_args ./configs/wan22.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --visual_gen_args ./configs/flux1.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --visual_gen_args ./configs/flux2.yml
+   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --visual_gen_args ./configs/ltx2.yml
+   trtllm-serve $LLM_MODEL_DIR/Qwen-Image --visual_gen_args ./configs/qwen_image.yml
 
    # Run server on background:
-   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan21.yml > /tmp/serve.log 2>&1 &
+   trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --visual_gen_args ./configs/wan21.yml > /tmp/serve.log 2>&1 &
 
    ## Check if the server is setup
    tail -f /tmp/serve.log
@@ -62,6 +59,7 @@ Current supported & tested models:
 2. FLUX.1 for image generation (t2i)
 3. FLUX.2 for image generation (t2i)
 4. LTX-2 for video generation with audio (t2v, ti2v)
+5. Qwen-Image for image generation (t2i)
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
@@ -69,7 +67,7 @@ Demonstrates synchronous text-to-image generation using the OpenAI SDK. Supports
 
 **Features:**
 - Generates images from text prompts
-- Supports configurable model, image size, and quality
+- Supports configurable model and image size
 - Returns base64-encoded images or URLs
 - Saves generated images to disk
 
@@ -148,7 +146,7 @@ python sync_video_gen.py --mode ti2v \
 - `--size` - Video resolution in WxH format (default: 256x256)
 - `--output` - Output video file path (default: output_sync.mp4)
 
-**API Endpoint:** `POST /v1/videos/generations`
+**API Endpoint:** `POST /v1/videos/sync`
 
 **API Details:**
 - T2V uses JSON `Content-Type: application/json`
@@ -271,20 +269,86 @@ You can customize these by:
 ## Common Parameters
 
 ### Image Generation
-- `model`: Model identifier (e.g., "flux1", "flux2")
-- `prompt`: Text description
+- `prompt`: Text description (required)
 - `n`: Number of images to generate
-- `size`: Image dimensions (e.g., "512x512", "1024x1024")
-- `quality`: "standard" or "hd"
-- `response_format`: "b64_json" or "url"
+- `size`: Image dimensions in `WxH` format (e.g., `"512x512"`, `"1024x1024"`) — or use the structured pair `width` + `height` (both required when sent)
+- `seed`: Random seed; `null` / omitted means the engine draws a fresh seed
+- `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls (override pipeline defaults when sent)
+- `extra_params`: model-specific overflow as a JSON object (see "Model-Specific `extra_params`" below). Unknown keys are rejected by the executor.
+- `response_format`: `"url"` (default; HTTP URL to `/content`), `"b64_json"` (inline base64), or `"path"` (server-side on-disk path, for co-located clients)
+- `format`: Generation content encoding. Image encoders: `"png"`, `"webp"`, `"jpeg"`. Tensor formats: `"safetensors"`, `"pt"`.
+- Accept-and-warn OpenAI-shape fields (no engine semantic): `model`, `quality`, `style`, `user`. Sending `quality`/`style` logs a server-side WARNING; sending `model` warns on mismatch. None of these change generation behavior.
 
 ### Video Generation
-- `model`: Model identifier (e.g., "wan", "ltx2")
-- `prompt`: Text description
-- `size`: Video resolution (e.g., "256x256", "512x512", "1280x720")
-- `seconds`: Duration in seconds
-- `fps`: Frames per second
-- `input_reference`: Reference image file (for TI2V mode)
+- `prompt`: Text description (required)
+- `size` / `width` / `height`: same convention as image
+- `seconds`: Duration in seconds (engine multiplies by `frame_rate` to derive `num_frames` when the latter is absent)
+- `frame_rate` (canonical) or `fps` (alias): frames per second
+- `num_frames`: when set, wins over the `seconds * frame_rate` derivation
+- `seed`, `num_inference_steps`, `guidance_scale`, `max_sequence_length`, `negative_prompt`: per-request denoise controls
+- `input_reference`: Reference image (I2V/TI2V) or video (V2V), accepted as a base64-encoded string in JSON or as a file in multipart form-data
+  - **Supported formats**: PNG and JPEG images; MP4 and AVI video, with H.264 the tested codec and others best-effort. HEIF/AVIF are not supported.
+- `extra_params`: model-specific overflow (see below)
+- `response_format`: `"file"` (default; `FileResponse` byte download) or `"path"` (server-side output path JSON, for co-located clients)
+- `format`: Generation content encoding. Video encoders: `"mp4"`, `"avi"`, `"auto"`. Tensor formats: `"safetensors"`, `"pt"` (carries video + audio + scalar metadata in one payload for LTX-2).
+
+> **`response_format="path"`** (image and video) returns absolute server-side file paths under the server's media-storage directory (`TRTLLM_MEDIA_STORAGE_PATH`), for clients co-located with the server (shared filesystem). Enabled by default; set `TRTLLM_DISALLOW_LOCAL_MEDIA_PATH=1` to reject `path` requests with HTTP 400.
+
+#### Tensor-format consumer contract
+
+When `format="safetensors"` or `format="pt"`, the payload bundles every populated media tensor (`image` / `video` / `audio`) and the scalar metadata (`frame_rate`, `audio_sample_rate`) into one file.
+
+- **`pt`**: `torch.load(buf, weights_only=True)` returns a dict with the tensor keys and the scalars as native Python values.
+- **`safetensors`**: `safetensors.torch.load(bytes)` returns a dict with the tensor keys and each scalar as a 0-d tensor under the same key — call `.item()` to unbox (e.g. `loaded["frame_rate"].item()`). The same scalars are also written to the safetensors file header as strings; `safe_open(path, framework="pt").metadata()` exposes them in that form for consumers that prefer header access.
+
+#### Unknown-field policy
+
+The visual-gen endpoints reject unknown top-level fields with HTTP 422 (`extra="forbid"`). Anything model-specific belongs inside `extra_params`. Sending `output_format`, top-level `guidance_rescale`, or — for video — top-level `n` returns 422 with the offending field named in the error body.
+
+#### Model-specific `extra_params`
+
+Use the Python API to discover accepted keys for a loaded pipeline:
+
+```python
+generator = VisualGen(model="...")
+print(generator.extra_param_specs)   # {key: ExtraParamSchema(type=..., range=..., default=..., description=...)}
+```
+
+Examples:
+- **LTX-2**: `stg_scale`, `stg_blocks`, `modality_scale`, `guidance_rescale`, `output_type`, ...
+- **Wan 2.2 A14B**: `guidance_scale_2`, `boundary_ratio`
+- **Wan 2.1 / Flux**: no model-specific `extra_params` declared
+- **Cosmos3**: `condition_video_latent_indexes`, `condition_video_keep` (V2V conditioning), `flow_shift`, `use_system_prompt`, and the transfer hints `edge`/`blur`/`depth`/`seg`/`wsm` with `control_guidance`, `control_guidance_interval`, `num_video_frames_per_chunk`, ... (see below)
+
+##### Cosmos3 transfer hints
+
+`extra_params` is JSON, so a control clip travels as a **base64-encoded** MP4/AVI
+string under `<hint>.control`; the server decodes it at the HTTP boundary. Only
+`edge` and `blur` can be auto-computed — pass `true` and supply a `video`
+reference for them to derive from. `depth`/`seg`/`wsm` have no generator, so
+they always need a control clip.
+
+```json
+{
+  "prompt": "a city street at dusk",
+  "extra_params": {
+    "video": "<base64 MP4/AVI>",
+    "edge": {"preset_edge_threshold": "medium"},
+    "blur": {"preset_blur_strength": "medium"},
+    "depth": {"control": "<base64 MP4/AVI>"},
+    "control_guidance": 1.5
+  }
+}
+```
+
+`preset_edge_threshold` and `preset_blur_strength` accept
+`none`/`very_low`/`low`/`medium`/`high`/`very_high` and default to `medium`; a
+bare `true` (or `"<base64>"`) is shorthand for the object form. Individual
+values are validated before the job is queued, so a bad preset or an
+unsupported frame count fails fast; combinations that only make sense together
+— a transfer option with no hint selected, or `edge`/`blur` asked to
+auto-compute with no `video` — are still reported by the worker, as a client
+error, once the request is running.
 
 > **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
 > `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
@@ -327,10 +391,24 @@ curl -X POST "http://localhost:8000/v1/videos" \
   -F "guidance_scale=5.0"
 ```
 
+### Video-to-Video (Multipart with File Upload, Cosmos3)
+```bash
+# The reference is classified by content: image -> I2V, video -> V2V.
+# V2V conditioning knobs ride in extra_params (values below are the defaults).
+curl -X POST "http://localhost:8000/v1/videos" \
+  -F "prompt=Continue the same scene with smooth natural motion and consistent subjects." \
+  -F "input_reference=@./media/reference.mp4" \
+  -F "num_frames=189" \
+  -F "fps=24" \
+  -F 'extra_params={"condition_video_latent_indexes": [0, 1], "condition_video_keep": "first"}'
+```
+
 ### Check Video Status
 ```bash
 curl -X GET "http://localhost:8000/v1/videos/{video_id}"
 ```
+
+The async job's `status` advances `queued` → `generating` (model inference) → `postprocessing` (encode the media and/or write the output file) → `completed`. The `generating` → `postprocessing` transition marks the end of inference; poll for `completed` to download via `/content`.
 
 ### Download Video
 ```bash
@@ -352,14 +430,14 @@ curl -X DELETE "http://localhost:8000/v1/videos/{video_id}"
 | Endpoint | Method | Mode | Content-Type | Purpose |
 |----------|--------|------|--------------|---------|
 | `/v1/videos` | POST | Async | JSON or Multipart | Create video job (T2V/TI2V) |
-| `/v1/videos/generations` | POST | Sync | JSON or Multipart | Generate video sync (T2V/TI2V) |
+| `/v1/videos/sync` | POST | Sync | JSON or Multipart | Generate video sync (T2V/TI2V) |
 | `/v1/videos/{id}` | GET | - | - | Get video status/metadata |
 | `/v1/videos/{id}/content` | GET | - | - | Download video file |
 | `/v1/videos/{id}` | DELETE | - | - | Delete video |
 | `/v1/videos` | GET | - | - | List all videos |
 | `/v1/images/generations` | POST | - | JSON | Generate images (T2I) |
 
-**Note:** Both `/v1/videos` (async) and `/v1/videos/generations` (sync) support:
+**Note:** Both `/v1/videos` (async) and `/v1/videos/sync` (sync) support:
 - **JSON**: Standard text-to-video (T2V)
 - **Multipart/Form-Data**: Text+image-to-video (TI2V) with file upload
 

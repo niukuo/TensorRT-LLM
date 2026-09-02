@@ -1,5 +1,5 @@
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from .interface import AttentionBackend, AttentionMetadata
+from .interface import AttentionBackend, AttentionForwardArgs, AttentionMetadata
 from .sparse import get_sparse_attn_kv_cache_manager
 from .trtllm import AttentionInputType, TrtllmAttention, TrtllmAttentionMetadata
 from .vanilla import VanillaAttention, VanillaAttentionMetadata
@@ -7,6 +7,7 @@ from .vanilla import VanillaAttention, VanillaAttentionMetadata
 __all__ = [
     "AttentionMetadata",
     "AttentionBackend",
+    "AttentionForwardArgs",
     "AttentionInputType",
     "TrtllmAttention",
     "TrtllmAttentionMetadata",
@@ -17,8 +18,4 @@ __all__ = [
 
 if IS_FLASHINFER_AVAILABLE:
     from .flashinfer import FlashInferAttention, FlashInferAttentionMetadata
-    from .star_flashinfer import StarAttention, StarAttentionMetadata
-    __all__ += [
-        "FlashInferAttention", "FlashInferAttentionMetadata", "StarAttention",
-        "StarAttentionMetadata"
-    ]
+    __all__ += ["FlashInferAttention", "FlashInferAttentionMetadata"]
